@@ -73,6 +73,83 @@ describe("document block extraction", () => {
       "figure-caption",
     ]);
   });
+
+  it("keeps same-height text in separate columns", () => {
+    const blocks = groupPageTextItems(
+      [
+        {
+          str: "The left column starts here",
+          x: 72,
+          y: 700,
+          width: 190,
+          height: 10,
+          fontSize: 10,
+        },
+        {
+          str: "The right column starts here",
+          x: 330,
+          y: 700,
+          width: 190,
+          height: 10,
+          fontSize: 10,
+        },
+        {
+          str: "and continues on its next line.",
+          x: 72,
+          y: 686,
+          width: 180,
+          height: 10,
+          fontSize: 10,
+        },
+        {
+          str: "and also continues independently.",
+          x: 330,
+          y: 686,
+          width: 188,
+          height: 10,
+          fontSize: 10,
+        },
+      ],
+      { documentId: "doc", pageNumber: 1, pageWidth: 600, pageHeight: 800 },
+    );
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks.map((block) => block.text)).toEqual([
+      "The left column starts here and continues on its next line.",
+      "The right column starts here and also continues independently.",
+    ]);
+    expect(blocks.every((block) => block.bbox.width < 0.4)).toBe(true);
+  });
+
+  it("does not merge a numbered heading into its paragraph", () => {
+    const blocks = groupPageTextItems(
+      [
+        {
+          str: "2. Layout Model",
+          x: 72,
+          y: 700,
+          width: 110,
+          height: 11,
+          fontSize: 11,
+        },
+        {
+          str: "Each block stores normalized coordinates.",
+          x: 72,
+          y: 685,
+          width: 220,
+          height: 10,
+          fontSize: 10,
+        },
+      ],
+      { documentId: "doc", pageNumber: 1, pageWidth: 600, pageHeight: 800 },
+    );
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks.map((block) => block.type)).toEqual([
+      "heading",
+      "paragraph",
+    ]);
+  });
 });
 describe("document references", () => {
   it("detects references and resolves them to caption blocks", () => {

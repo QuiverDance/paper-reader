@@ -13,7 +13,8 @@ preserving the existing PDF reader and synchronized split-view behavior.
   heading, paragraph, caption, footnote, and unknown classification.
 - OpenAI-compatible provider settings stored locally.
 - Block translation for a selection, page, page range, or whole document;
-  progress, cancellation between batches, retry, cache, editing, and overlay.
+  progress, cancellation between batches, retry, cache, editing, masking, and
+  in-place re-typesetting.
 - Word lookup using the configured provider with a local context cache.
 - Figure/Table reference detection and caption-target preview.
 - Original/translation highlights and document/page/selection notes.
@@ -34,8 +35,9 @@ preserving the existing PDF reader and synchronized split-view behavior.
 
 1. The PDF remains the source of truth and is never modified.
 2. All page geometry is stored as normalized coordinates.
-3. Translation and annotation overlays are HTML layers attached to PDF.js page
-   elements, so zoom and rotation remain controlled by PDF.js.
+3. Translation is re-typeset in place: an HTML page layer samples and masks the
+   source-text background, then fits translated text back into the same geometry.
+   Annotation overlays remain separate, and PDF.js still controls zoom/rotation.
 4. The LLM adapter has one small interface and uses a Tauri HTTP command in the
    desktop app; browser development uses `fetch`.
 5. API keys are local settings and are never logged or included in repository

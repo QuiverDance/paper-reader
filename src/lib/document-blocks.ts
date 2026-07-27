@@ -70,7 +70,13 @@ function joinLineItems(items: RawTextItem[]): string {
     .replace(/([(\[])\s+/g, "$1");
 }
 
-function makeLines(items: RawTextItem[]): TextLine[] {
+function horizontalGap(line: TextLine, item: RawTextItem): number {
+  if (item.x > line.maxX) return item.x - line.maxX;
+  if (item.x + item.width < line.minX) return line.minX - (item.x + item.width);
+  return 0;
+}
+
+function makeLines(items: RawTextItem[], pageWidth: number): TextLine[] {
   const sorted = [...items]
     .filter((item) => item.str.trim())
     .sort((left, right) => right.y - left.y || left.x - right.x);
@@ -78,11 +84,22 @@ function makeLines(items: RawTextItem[]): TextLine[] {
 
   for (const item of sorted) {
     const tolerance = Math.max(2, item.fontSize * 0.35);
-    const line = lines.find(
-      (candidate) =>
-        Math.abs(candidate.items[0].y - item.y) <=
-        Math.max(tolerance, candidate.fontSize * 0.35),
-    );
+    const line = lines
+      .filter(
+        (candidate) =>
+          Math.abs(candidate.items[0].y - item.y) <=
+            Math.max(tolerance, candidate.fontSize * 0.35) &&
+          horizontalGap(candidate, item) <=
+            Math.max(
+              8,
+              Math.max(item.fontSize, candidate.fontSize) * 1.8,
+              pageWidth * 0.018,
+            ),
+      )
+      .sort(
+        (left, right) =>
+          horizontalGap(left, item) - horizontalGap(right, item),
+      )[0];
     if (line) {
       line.items.push(item);
       line.text = joinLineItems(line.items);
@@ -130,19 +147,19 @@ function classifyBlock(
     return "heading";
   }
   if (
-    /^(?:\d+(?:\.\d+)*\.?\s+)?[A-Z][^\n]{2,100}$/.test(normalized) &&
-    (fontSize >= medianFontSize * 1.18 ||
-      /^\d+(?:\.\d+)*\.?\s+/.test(normalized))
-  ) {
-    return "heading";
-  }
-  if (
     pageNumber === 1 &&
     bbox.y < 0.35 &&
     fontSize >= Math.max(14, medianFontSize * 1.35) &&
     normalized.length < 240
   ) {
     return "title";
+  }
+  if (
+    /^(?:\d+(?:\.\d+)*\.?\s+)?[A-Z][^\n]{2,100}$/.test(normalized) &&
+    (fontSize >= medianFontSize * 1.18 ||
+      /^\d+(?:\.\d+)*\.?\s+/.test(normalized))
+  ) {
+    return "heading";
   }
   if (bbox.y > 0.88 && fontSize < medianFontSize * 0.9) return "footnote";
   return normalized.length > 1 ? "paragraph" : "unknown";
@@ -168,10 +185,21 @@ function shouldMergeLines(
   const specialLine =
     /^(?:fig(?:ure)?\.?|table)\s*\d+/i.test(previous.text) ||
     /^(?:fig(?:ure)?\.?|table)\s*\d+/i.test(next.text);
+  const structuralLine =
+    /^(?:abstract|references|bibliography|acknowledg(?:e)?ments?)\s*$/i.test(
+      previous.text,
+    ) ||
+    /^(?:abstract|references|bibliography|acknowledg(?:e)?ments?)\s*$/i.test(
+      next.text,
+    ) ||
+    /^\d+(?:\.\d+)*\.?\s+[A-Z]/.test(previous.text) ||
+    /^\d+(?:\.\d+)*\.?\s+[A-Z]/.test(next.text);
 
   return (
     !specialLine &&
+    !structuralLine &&
     verticalGap <= Math.max(previous.fontSize, next.fontSize) * 0.9 &&
+    verticalGap >= -Math.max(previous.fontSize, next.fontSize) * 0.25 &&
     fontDelta <= Math.max(previous.fontSize, next.fontSize) * 0.2 &&
     indentationDelta <= pageWidth * 0.08 &&
     (!previousEndsSentence || next.text.length < 80)
@@ -182,18 +210,29 @@ export function groupPageTextItems(
   items: RawTextItem[],
   context: PageContext,
 ): DocumentBlock[] {
-  const lines = makeLines(items);
+  const lines = makeLines(items, context.pageWidth);
   if (!lines.length) return [];
   const medianFontSize = median(lines.map((line) => line.fontSize)) || 12;
   const groups: TextLine[][] = [];
 
   for (const line of lines) {
-    const current = groups.at(-1);
-    if (
-      current &&
-      shouldMergeLines(current.at(-1)!, line, context.pageWidth)
-    ) {
-      current.push(line);
+    const candidate = groups
+      .filter((group) =>
+        shouldMergeLines(group.at(-1)!, line, context.pageWidth),
+      )
+      .sort((left, right) => {
+        const leftLast = left.at(-1)!;
+        const rightLast = right.at(-1)!;
+        const leftGap =
+          Math.max(0, leftLast.minY - line.maxY) * 3 +
+          Math.abs(leftLast.minX - line.minX);
+        const rightGap =
+          Math.max(0, rightLast.minY - line.maxY) * 3 +
+          Math.abs(rightLast.minX - line.minX);
+        return leftGap - rightGap;
+      })[0];
+    if (candidate) {
+      candidate.push(line);
     } else {
       groups.push([line]);
     }
@@ -228,7 +267,7 @@ export function groupPageTextItems(
     );
 
     return {
-      id: `${context.documentId}-p${context.pageNumber}-b${readingOrder}`,
+      id: `${context.documentId}-p${context.pageNumber}-v2-b${readingOrder}`,
       documentId: context.documentId,
       pageNumber: context.pageNumber,
       type,

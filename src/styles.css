@@ -1857,7 +1857,7 @@ textarea:focus-visible {
   isolation: isolate;
 }
 
-.paper-overlay-root {
+.paper-overlay-host {
   position: absolute;
   z-index: 4;
   inset: 0;
@@ -1865,8 +1865,15 @@ textarea:focus-visible {
   pointer-events: none;
 }
 
+.paper-overlay-root {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .highlight-overlay,
-.translation-overlay-block,
+.translation-reflow-block,
 .reference-hotspot {
   position: absolute;
 }
@@ -1879,42 +1886,114 @@ textarea:focus-visible {
   pointer-events: none;
 }
 
-.translation-overlay-block {
+.translation-reflow-block {
   z-index: 3;
-  min-width: 26px;
-  min-height: 14px;
+  box-sizing: border-box;
   overflow: hidden;
-  padding: 2px 3px;
-  border: 1px solid rgba(35, 114, 87, 0.48);
-  border-radius: 2px;
-  color: #15201d;
-  background: rgba(235, 251, 244, 0.95);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  padding: 0 1px;
+  border: 0;
+  color: #111;
   pointer-events: auto;
-  font-family: Pretendard, "Noto Sans KR", sans-serif;
-  font-size: clamp(6px, 0.55vw, 8px);
-  line-height: 1.26;
+  font-family: "Noto Sans KR", Pretendard, Arial, sans-serif;
+  font-weight: 400;
+  line-height: 1.08;
+  letter-spacing: -0.018em;
+  text-rendering: optimizeLegibility;
+  user-select: text;
 }
 
-.translation-overlay-block svg {
-  width: 8px;
-  height: 8px;
-  margin-right: 2px;
-  vertical-align: -1px;
+.translation-reflow-block > span {
+  display: block;
+  width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  hyphens: auto;
 }
 
-.translation-overlay-block span {
-  outline: 0;
+.translation-reflow-block[data-block-type="title"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 720;
+  line-height: 1.04;
+  letter-spacing: -0.028em;
+  text-align: center;
 }
 
-.translation-overlay-block:hover,
-.translation-overlay-block:focus-within {
+.translation-reflow-block[data-block-type="authors"] {
+  text-align: center;
+}
+
+.translation-reflow-block[data-block-type="heading"] {
+  display: flex;
+  align-items: center;
+  font-weight: 680;
+  line-height: 1.04;
+  letter-spacing: -0.024em;
+}
+
+.translation-reflow-block[data-block-type="paragraph"],
+.translation-reflow-block[data-block-type="abstract"],
+.translation-reflow-block[data-block-type="footnote"] {
+  text-align: justify;
+  text-justify: inter-character;
+}
+
+.translation-reflow-block[data-block-type="figure-caption"],
+.translation-reflow-block[data-block-type="table-caption"],
+.translation-reflow-block[data-block-type="footnote"] {
+  font-family: "Noto Serif KR", "Noto Sans KR", Pretendard, serif;
+  line-height: 1.08;
+  letter-spacing: -0.012em;
+}
+
+.translation-reflow-block--overflow {
+  cursor: zoom-in;
+}
+
+.translation-reflow-block--overflow::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding: 0 2px;
+  color: #705c3c;
+  background: inherit;
+  content: "…";
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 10px;
+}
+
+.translation-reflow-block--revealed {
   z-index: 8;
-  height: auto !important;
-  max-height: 180px;
-  overflow: auto;
-  outline: 2px solid rgba(35, 114, 87, 0.5);
-  font-size: 9px;
+  cursor: zoom-out;
+  box-shadow:
+    0 0 0 1px rgba(88, 78, 61, 0.18),
+    0 3px 10px rgba(33, 28, 20, 0.14) !important;
+}
+
+.translation-reflow-block--revealed::after {
+  display: none;
+}
+
+.translation-reflow-block--editing {
+  z-index: 9;
+  outline: 1px solid rgba(46, 116, 91, 0.55);
+}
+
+.translation-reflow-block textarea {
+  width: 100%;
+  height: 100%;
+  resize: none;
+  padding: 1px 2px;
+  border: 0;
+  outline: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  line-height: inherit;
+  letter-spacing: inherit;
 }
 
 .reference-hotspot {

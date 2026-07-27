@@ -7,7 +7,8 @@ import {
   PDFLinkService,
   PDFViewer,
 } from "pdfjs-dist/web/pdf_viewer.mjs";
-import { Languages, LoaderCircle, ScanSearch } from "lucide-react";
+import { LoaderCircle, ScanSearch } from "lucide-react";
+import { TranslatedTextBlock } from "./TranslatedTextBlock";
 import type {
   DocumentBlock,
   DocumentReference,
@@ -19,6 +20,11 @@ import type {
   ViewState,
 } from "../types";
 import { clamp } from "../lib/reader-state";
+import {
+  availableTranslationHeight,
+  availableTranslationWidth,
+  translationMaskRect,
+} from "../lib/translation-layout";
 
 type PdfPaneProps = {
   document: PDFDocumentProxy;
@@ -46,7 +52,11 @@ type ScaleChangingEvent = {
   presetValue?: string | null;
 };
 type RotationChangingEvent = { pagesRotation: number };
-type PageElement = { pageNumber: number; element: HTMLElement };
+type PageElement = {
+  pageNumber: number;
+  host: HTMLElement;
+  revision: number;
+};
 
 function rotateRect(rect: NormalizedRect, rotation: number): NormalizedRect {
   if (rotation === 90) {
@@ -112,6 +122,7 @@ export function PdfPane({
   const applyingRef = useRef(false);
   const releaseTimerRef = useRef<number | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
+  const pageRevisionRef = useRef(0);
   const latestStateRef = useRef(targetState);
   const [ready, setReady] = useState(false);
   const [pageElements, setPageElements] = useState<PageElement[]>([]);
@@ -131,11 +142,22 @@ export function PdfPane({
   const collectPageElements = () => {
     const viewerElement = viewerElementRef.current;
     if (!viewerElement) return;
+    pageRevisionRef.current += 1;
+    const revision = pageRevisionRef.current;
     setPageElements(
       Array.from(viewerElement.querySelectorAll<HTMLElement>(".page")).flatMap(
         (element) => {
           const pageNumber = Number(element.dataset.pageNumber);
-          return Number.isFinite(pageNumber) ? [{ pageNumber, element }] : [];
+          if (!Number.isFinite(pageNumber)) return [];
+          let host = element.querySelector<HTMLElement>(
+            ".paper-overlay-host",
+          );
+          if (!host) {
+            host = window.document.createElement("div");
+            host.className = "paper-overlay-host";
+            element.append(host);
+          }
+          return [{ pageNumber, host, revision }];
         },
       ),
     );
@@ -270,6 +292,12 @@ export function PdfPane({
       }
     };
 
+    const onPageRendered = () => {
+      window.requestAnimationFrame(() => {
+        if (pdfViewerRef.current === viewer) collectPageElements();
+      });
+    };
+
     const reportScrollAnchor = () => {
       scrollFrameRef.current = null;
       if (applyingRef.current || !readyRef.current) return;
@@ -295,6 +323,7 @@ export function PdfPane({
     eventBus.on("pagechanging", onPageChanging);
     eventBus.on("scalechanging", onScaleChanging);
     eventBus.on("rotationchanging", onRotationChanging);
+    eventBus.on("pagerendered", onPageRendered);
     container.addEventListener("scroll", onScroll, { passive: true });
 
     return () => {
@@ -306,6 +335,7 @@ export function PdfPane({
       eventBus.off("pagechanging", onPageChanging);
       eventBus.off("scalechanging", onScaleChanging);
       eventBus.off("rotationchanging", onRotationChanging);
+      eventBus.off("pagerendered", onPageRendered);
       if (scrollFrameRef.current !== null) {
         window.cancelAnimationFrame(scrollFrameRef.current);
       }
@@ -385,7 +415,7 @@ export function PdfPane({
         )}
       </div>
 
-      {pageElements.map(({ pageNumber, element }) =>
+      {pageElements.map(({ pageNumber, host, revision }) =>
         createPortal(
           <div className="paper-overlay-root" aria-hidden={false}>
             {highlights
@@ -419,27 +449,35 @@ export function PdfPane({
                       candidate.status === "translated",
                   );
                   if (!translation) return null;
+                  const maskRect = translationMaskRect(block);
+                  const expandedRect = {
+                    ...maskRect,
+                    width: availableTranslationWidth(
+                      block,
+                      blocks.filter(
+                        (candidate) => candidate.pageNumber === pageNumber,
+                      ),
+                    ),
+                    height: availableTranslationHeight(
+                      block,
+                      blocks.filter(
+                        (candidate) => candidate.pageNumber === pageNumber,
+                      ),
+                    ),
+                  };
                   return (
-                    <div
-                      className="translation-overlay-block"
+                    <TranslatedTextBlock
                       key={translation.id}
-                      style={rectStyle(block.bbox, targetState.rotation)}
-                      title="번역문을 클릭해 직접 수정할 수 있습니다."
-                    >
-                      <Languages size={10} />
-                      <span
-                        contentEditable
-                        suppressContentEditableWarning
-                        onBlur={(event) =>
-                          onEditTranslation(
-                            translation,
-                            event.currentTarget.textContent ?? "",
-                          )
-                        }
-                      >
-                        {translation.translatedText}
-                      </span>
-                    </div>
+                      block={block}
+                      translation={translation}
+                      style={rectStyle(maskRect, targetState.rotation)}
+                      expandedStyle={rectStyle(
+                        expandedRect,
+                        targetState.rotation,
+                      )}
+                      scale={targetState.scale}
+                      onEdit={onEditTranslation}
+                    />
                   );
                 })}
 
@@ -472,8 +510,8 @@ export function PdfPane({
                   );
                 })}
           </div>,
-          element,
-          `${paneId}-${pageNumber}`,
+          host,
+          `${paneId}-${pageNumber}-${revision}`,
         ),
       )}
     </section>

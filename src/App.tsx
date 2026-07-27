@@ -350,8 +350,21 @@ function App() {
         setSessions([]);
         await saveDocument(nextReaderDocument);
         const savedBlocks = await hydrateDocumentData(id);
+        const needsAnalysis =
+          !savedBlocks.length ||
+          savedBlocks.some((block) => !block.id.includes("-v2-b"));
+        if (needsAnalysis && nextReaderDocument.translationProgress) {
+          const resetDocument = {
+            ...nextReaderDocument,
+            translationProgress: 0,
+          };
+          setReaderDocument(resetDocument);
+          await saveDocument(resetDocument);
+        }
         await refreshLibrary();
-        if (!savedBlocks.length) void analyzeDocument(document, id);
+        if (needsAnalysis) {
+          void analyzeDocument(document, id);
+        }
         if (oldDocument) void oldDocument.cleanup();
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
@@ -1170,7 +1183,7 @@ function App() {
                   document={pdfDocument}
                   paneId="companion"
                   label="번역 뷰"
-                  detail={`${settings?.targetLanguage ?? "ko"} · HTML overlay`}
+                  detail={`${settings?.targetLanguage ?? "ko"} · 위치 보존 조판`}
                   targetState={paneStates.companion}
                   active={activePane === "companion"}
                   blocks={blocks}

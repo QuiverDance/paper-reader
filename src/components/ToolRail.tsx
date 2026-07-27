@@ -141,7 +141,18 @@ export function ToolRail({
       ? translationJob.completedBlocks / translationJob.totalBlocks
       : 0
     : 0;
-  const failedCount = translations.filter(
+  const currentBlockIds = useMemo(
+    () => new Set(blocks.map((block) => block.id)),
+    [blocks],
+  );
+  const currentTranslations = useMemo(
+    () =>
+      translations.filter((translation) =>
+        currentBlockIds.has(translation.blockId),
+      ),
+    [currentBlockIds, translations],
+  );
+  const failedCount = currentTranslations.filter(
     (translation) => translation.status === "failed",
   ).length;
   const pageQuestionBlocks = useMemo(
@@ -234,7 +245,7 @@ export function ToolRail({
                 <span>문단 좌표 번역</span>
                 <small>
                   {blocks.length
-                    ? `${translations.filter((item) => item.status === "translated").length}/${blocks.filter((block) => block.translatable).length}`
+                    ? `${currentTranslations.filter((item) => item.status === "translated").length}/${blocks.filter((block) => block.translatable).length}`
                     : "분석 중"}
                 </small>
               </div>
@@ -327,7 +338,7 @@ export function ToolRail({
             )}
 
             <div className="translation-list">
-              {translations
+              {currentTranslations
                 .filter((translation) => {
                   const block = blocks.find(
                     (candidate) => candidate.id === translation.blockId,
