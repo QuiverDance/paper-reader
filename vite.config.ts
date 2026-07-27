@@ -1,8 +1,9 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import { codexBridge } from "./scripts/codex-bridge";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), codexBridge()],
   clearScreen: false,
   server: {
     port: 1420,

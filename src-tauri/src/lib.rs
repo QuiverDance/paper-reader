@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
-    io::Read,
+    fs::{self, File},
+    io::{Read, Write},
     path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
     time::SystemTime,
 };
 use tauri::ipc::Response;
@@ -181,21 +182,22 @@ fn validate_llm_endpoint(endpoint: &str) -> Result<(), String> {
 #[tauri::command]
 async fn llm_chat(request: LlmRequest) -> Result<String, String> {
     validate_llm_endpoint(&request.endpoint)?;
-    if request.api_key.trim().is_empty() || request.model.trim().is_empty() {
-        return Err("API key와 모델명을 설정해 주세요.".to_string());
+    if request.model.trim().is_empty() {
+        return Err("모델명을 설정해 주세요.".to_string());
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|_| "LLM HTTP client를 만들지 못했습니다.".to_string())?;
-    let response = client
-        .post(&request.endpoint)
-        .bearer_auth(&request.api_key)
-        .json(&serde_json::json!({
-            "model": request.model,
-            "messages": request.messages,
-            "stream": false
-        }))
+    let mut request_builder = client.post(&request.endpoint).json(&serde_json::json!({
+        "model": request.model,
+        "messages": request.messages,
+        "stream": false
+    }));
+    if !request.api_key.trim().is_empty() {
+        request_builder = request_builder.bearer_auth(&request.api_key);
+    }
+    let response = request_builder
         .send()
         .await
         .map_err(|error| format!("LLM 서버에 연결하지 못했습니다: {error}"))?;
@@ -216,6 +218,251 @@ async fn llm_chat(request: LlmRequest) -> Result<String, String> {
         .and_then(|choice| choice.message.content)
         .filter(|content| !content.trim().is_empty())
         .ok_or_else(|| "LLM 응답 내용이 비어 있습니다.".to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAuthStatus {
+    available: bool,
+    authenticated: bool,
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexCompletionRequest {
+    messages: Vec<LlmMessage>,
+    model: Option<String>,
+}
+
+struct CodexCommand {
+    program: String,
+    prefix_args: Vec<String>,
+}
+
+fn local_codex_command() -> Option<CodexCommand> {
+    let current = std::env::current_dir().ok()?;
+    for root in current.ancestors().take(4) {
+        let entry = root
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js");
+        if entry.is_file() {
+            return Some(CodexCommand {
+                program: "node".to_string(),
+                prefix_args: vec![entry.to_string_lossy().to_string()],
+            });
+        }
+    }
+    None
+}
+
+fn codex_command() -> CodexCommand {
+    local_codex_command().unwrap_or_else(|| CodexCommand {
+        program: "codex".to_string(),
+        prefix_args: Vec::new(),
+    })
+}
+
+fn codex_working_directory() -> Result<PathBuf, String> {
+    let directory = std::env::temp_dir().join("paperloom-codex");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Codex 작업 폴더를 만들지 못했습니다: {error}"))?;
+    Ok(directory)
+}
+
+fn display_codex_error(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    if message.chars().count() > 4000 {
+        message.chars().take(4000).collect()
+    } else {
+        message
+    }
+}
+
+fn run_codex(args: Vec<String>, input: Option<String>) -> Result<Output, String> {
+    let command_spec = codex_command();
+    let mut command = Command::new(&command_spec.program);
+    command
+        .args(command_spec.prefix_args)
+        .args(args)
+        .current_dir(codex_working_directory()?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Codex CLI를 실행하지 못했습니다: {error}"))?;
+    if let Some(value) = input {
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "Codex 입력을 열지 못했습니다.".to_string())?
+            .write_all(value.as_bytes())
+            .map_err(|error| format!("Codex에 요청을 전달하지 못했습니다: {error}"))?;
+    }
+    child
+        .wait_with_output()
+        .map_err(|error| format!("Codex 응답을 기다리지 못했습니다: {error}"))
+}
+
+fn codex_status_sync() -> CodexAuthStatus {
+    match run_codex(vec!["login".to_string(), "status".to_string()], None) {
+        Ok(output) => {
+            let message = {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if stdout.is_empty() {
+                    display_codex_error(&output)
+                } else {
+                    stdout
+                }
+            };
+            let normalized = message.to_ascii_lowercase();
+            CodexAuthStatus {
+                available: true,
+                authenticated: output.status.success()
+                    && (normalized.contains("logged in") || normalized.contains("authenticated")),
+                message: if message.is_empty() {
+                    "Codex 로그인 상태를 확인했습니다.".to_string()
+                } else {
+                    message
+                },
+            }
+        }
+        Err(error) => CodexAuthStatus {
+            available: false,
+            authenticated: false,
+            message: error,
+        },
+    }
+}
+
+#[tauri::command]
+async fn codex_auth_status() -> Result<CodexAuthStatus, String> {
+    tauri::async_runtime::spawn_blocking(codex_status_sync)
+        .await
+        .map_err(|error| format!("Codex 로그인 상태를 확인하지 못했습니다: {error}"))
+}
+
+#[tauri::command]
+async fn codex_login() -> Result<CodexAuthStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let output = run_codex(vec!["login".to_string()], None)?;
+        if !output.status.success() {
+            return Err({
+                let message = display_codex_error(&output);
+                if message.is_empty() {
+                    "Codex 로그인이 완료되지 않았습니다.".to_string()
+                } else {
+                    message
+                }
+            });
+        }
+        Ok(codex_status_sync())
+    })
+    .await
+    .map_err(|error| format!("Codex 로그인을 실행하지 못했습니다: {error}"))?
+}
+
+fn codex_prompt(messages: &[LlmMessage]) -> Result<String, String> {
+    let conversation = serde_json::to_string(messages)
+        .map_err(|error| format!("Codex 요청을 만들지 못했습니다: {error}"))?;
+    Ok([
+        "You are the language-model backend for Paperloom, a local PDF reader.",
+        "Do not use tools, inspect files, run commands, or access the environment.",
+        "Answer only from the conversation supplied below.",
+        "Follow system-role messages as the highest-priority instructions.",
+        "Return only the assistant response, with no preamble or commentary.",
+        "",
+        &conversation,
+    ]
+    .join("\n"))
+}
+
+#[tauri::command]
+async fn codex_complete(request: CodexCompletionRequest) -> Result<String, String> {
+    if request.messages.is_empty() || request.messages.len() > 100 {
+        return Err("Codex 요청의 메시지 수가 올바르지 않습니다.".to_string());
+    }
+    let character_count: usize = request
+        .messages
+        .iter()
+        .map(|message| message.content.chars().count())
+        .sum();
+    if character_count > 1_000_000 {
+        return Err("한 번에 보낼 수 있는 문서 분량을 초과했습니다.".to_string());
+    }
+    if request
+        .messages
+        .iter()
+        .any(|message| !matches!(message.role.as_str(), "system" | "user" | "assistant"))
+    {
+        return Err("지원하지 않는 Codex 메시지 역할입니다.".to_string());
+    }
+
+    let prompt = codex_prompt(&request.messages)?;
+    let model = request
+        .model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if model.as_ref().is_some_and(|value| value.len() > 120) {
+        return Err("Codex 모델명이 너무 깁니다.".to_string());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut args = vec![
+            "exec".to_string(),
+            "--sandbox".to_string(),
+            "read-only".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--ephemeral".to_string(),
+            "--ignore-user-config".to_string(),
+            "--ignore-rules".to_string(),
+            "--color".to_string(),
+            "never".to_string(),
+            "-C".to_string(),
+            codex_working_directory()?.to_string_lossy().to_string(),
+        ];
+        if let Some(value) = model {
+            args.push("--model".to_string());
+            args.push(value);
+        }
+        args.push("-".to_string());
+
+        let output = run_codex(args, Some(prompt))?;
+        if !output.status.success() {
+            let message = display_codex_error(&output);
+            return Err(if message.is_empty() {
+                "Codex 요청이 실패했습니다.".to_string()
+            } else {
+                message
+            });
+        }
+        let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if content.is_empty() {
+            Err("Codex 응답 내용이 비어 있습니다.".to_string())
+        } else {
+            Ok(content)
+        }
+    })
+    .await
+    .map_err(|error| format!("Codex 요청을 완료하지 못했습니다: {error}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -384,7 +631,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_pdf,
             scan_pdf_directory,
-            llm_chat
+            llm_chat,
+            codex_auth_status,
+            codex_login,
+            codex_complete
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Paperloom");

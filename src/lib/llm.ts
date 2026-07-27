@@ -23,10 +23,23 @@ type DictionaryPayload = {
   explanation?: unknown;
 };
 
+export type CodexAuthStatus = {
+  available: boolean;
+  authenticated: boolean;
+  message: string;
+};
+
+type CodexCompletionRequest = {
+  messages: LlmMessage[];
+  model?: string;
+};
+
 export const DEFAULT_LLM_SETTINGS: LlmSettings = {
+  connectionMode: "api",
   endpoint: "https://api.openai.com/v1",
   apiKey: "",
   model: "gpt-4.1-mini",
+  codexModel: "",
   targetLanguage: "ko",
   instructions: "",
 };
@@ -36,6 +49,7 @@ function stripCodeFence(value: string): string {
   const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   return match ? match[1].trim() : trimmed;
 }
+
 function parseJsonObject(value: string): Record<string, unknown> {
   const parsed = JSON.parse(stripCodeFence(value)) as unknown;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -106,21 +120,80 @@ export function chatCompletionsUrl(endpoint: string): string {
   return `${normalized}/chat/completions`;
 }
 
-type CompletionResponse = {
-  choices?: Array<{ message?: { content?: string | null } }>;
-  error?: { message?: string };
-};
+async function readJsonResponse<T>(response: Response): Promise<T> {
+  const payload = (await response.json().catch(() => null)) as
+    | (T & { error?: string })
+    | null;
+  if (!response.ok) {
+    throw new Error(payload?.error || `로컬 LLM 연결 실패 (${response.status})`);
+  }
+  if (!payload) throw new Error("로컬 LLM 응답을 읽지 못했습니다.");
+  return payload;
+}
+
+export async function getCodexAuthStatus(): Promise<CodexAuthStatus> {
+  try {
+    if (runningInTauri()) {
+      return await invoke<CodexAuthStatus>("codex_auth_status");
+    }
+    const response = await fetch("/__paperloom/codex/status");
+    return readJsonResponse<CodexAuthStatus>(response);
+  } catch (cause) {
+    return {
+      available: false,
+      authenticated: false,
+      message:
+        cause instanceof Error
+          ? cause.message
+          : "Paperloom 실행기를 통해 열어 주세요.",
+    };
+  }
+}
+
+export async function startCodexLogin(): Promise<CodexAuthStatus> {
+  if (runningInTauri()) {
+    return invoke<CodexAuthStatus>("codex_login");
+  }
+  const response = await fetch("/__paperloom/codex/login", { method: "POST" });
+  return readJsonResponse<CodexAuthStatus>(response);
+}
+
+async function completeWithCodex(
+  request: CodexCompletionRequest,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (runningInTauri()) {
+    return invoke<string>("codex_complete", { request });
+  }
+
+  const response = await fetch("/__paperloom/codex/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+    signal,
+  });
+  const payload = await readJsonResponse<{ content: string }>(response);
+  if (!payload.content.trim()) throw new Error("Codex 응답 내용이 비어 있습니다.");
+  return payload.content;
+}
 
 export async function completeChat(
   settings: LlmSettings,
   messages: LlmMessage[],
   signal?: AbortSignal,
 ): Promise<string> {
+  if (settings.connectionMode === "codex") {
+    return completeWithCodex(
+      {
+        messages,
+        model: settings.codexModel.trim() || undefined,
+      },
+      signal,
+    );
+  }
+
   if (!settings.endpoint.trim() || !settings.model.trim()) {
     throw new Error("API endpoint와 모델명을 설정해 주세요.");
-  }
-  if (!settings.apiKey.trim()) {
-    throw new Error("API key를 설정해 주세요.");
   }
 
   if (runningInTauri()) {
@@ -134,22 +207,22 @@ export async function completeChat(
     });
   }
 
-  const response = await fetch(chatCompletionsUrl(settings.endpoint), {
+  const response = await fetch("/__paperloom/llm/complete", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${settings.apiKey}`,
     },
-    body: JSON.stringify({ model: settings.model, messages, stream: false }),
+    body: JSON.stringify({
+      endpoint: chatCompletionsUrl(settings.endpoint),
+      apiKey: settings.apiKey,
+      model: settings.model,
+      messages,
+    }),
     signal,
   });
-  const payload = (await response.json()) as CompletionResponse;
-  if (!response.ok) {
-    throw new Error(payload.error?.message || `LLM 요청 실패 (${response.status})`);
-  }
-  const content = payload.choices?.[0]?.message?.content;
-  if (!content) throw new Error("LLM 응답 내용이 비어 있습니다.");
-  return content;
+  const payload = await readJsonResponse<{ content: string }>(response);
+  if (!payload.content.trim()) throw new Error("LLM 응답 내용이 비어 있습니다.");
+  return payload.content;
 }
 
 export function translationMessages(

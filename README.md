@@ -36,6 +36,9 @@ Paperloom은 PDF 논문을 원문과 번역문으로 나란히 읽고, 읽는 �
 
 ## 실행
 
+Windows에서는 저장소 루트의 `Paperloom.cmd`를 더블클릭하면 필요한 패키지를
+자동으로 준비하고 브라우저에서 Paperloom을 엽니다.
+
 ```bash
 npm install
 npm run tauri dev
@@ -52,16 +55,28 @@ npm run dev
 
 ## LLM 설정
 
-오른쪽 위 설정 버튼에서 다음 값을 입력합니다.
+오른쪽 위 설정 버튼에서 두 가지 연결 방식 중 하나를 선택합니다.
+
+### API / OpenAI 호환
 
 - API endpoint: `https://api.openai.com/v1` 또는 호환 서버 주소
-- API key
-- 모델 이름
-- 번역 대상 언어
-- 선택 사항인 번역 지침
+- API key: 키가 필요 없는 localhost 서버는 비워 둘 수 있음
+- 실제 API 모델 이름과 번역 대상 언어
+- OpenCode TOML 파일 선택 또는 설정 텍스트 붙여넣기
 
-데스크톱 앱의 API 요청은 Rust 계층에서 전송됩니다. 설정은 이 장치의 Paperloom
-데이터에만 저장되고 애플리케이션 로그에는 출력하지 않습니다.
+OpenCode 가져오기는 `default_model`의 별칭을 따라 `[models]`와 `[providers]`를
+찾고 `base_url`, `api_key`, 실제 `model` 값을 Paperloom 설정에 적용합니다.
+
+### ChatGPT 로그인
+
+Paperloom에 포함된 공식 Codex CLI가 브라우저 로그인, 자격 증명 보관, 모델 요청을
+담당합니다. 설정에서 **ChatGPT 로그인**을 선택하면 현재 로그인 상태를 확인할 수
+있고, 필요하면 브라우저 로그인 절차를 시작할 수 있습니다. Paperloom은 Codex의
+토큰 파일을 직접 읽지 않으며 각 요청은 기록을 남기지 않는 임시 세션으로 실행됩니다.
+
+데스크톱 앱의 요청은 Rust 계층에서, `Paperloom.cmd` 브라우저 모드의 요청은
+localhost 브리지를 통해 전송됩니다. 설정은 이 장치의 Paperloom 데이터에만
+저장되고 애플리케이션 로그에는 출력하지 않습니다.
 
 ## 검증과 빌드
 

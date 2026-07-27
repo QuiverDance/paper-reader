@@ -30,7 +30,9 @@ try {
         throw "Node.js is required. Install Node.js 20 or newer, then run Paperloom.cmd again."
     }
 
-    if (-not (Test-Path (Join-Path $projectRoot "node_modules\.bin\vite.cmd"))) {
+    $viteReady = Test-Path (Join-Path $projectRoot "node_modules\.bin\vite.cmd")
+    $codexReady = Test-Path (Join-Path $projectRoot "node_modules\@openai\codex\bin\codex.js")
+    if (-not $viteReady -or -not $codexReady) {
         Write-Host "Preparing Paperloom for first use..."
         & $npmCommand.Source install --no-fund --no-audit
         if ($LASTEXITCODE -ne 0) {

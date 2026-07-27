@@ -174,9 +174,11 @@ export type ScannedPdfFile = {
 };
 
 export type LlmSettings = {
+  connectionMode: "api" | "codex";
   endpoint: string;
   apiKey: string;
   model: string;
+  codexModel: string;
   targetLanguage: string;
   instructions: string;
 };
