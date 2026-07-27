@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import type { ScannedPdfFile } from "../types";
 
 type BinaryResponse = ArrayBuffer | Uint8Array | number[];
 
@@ -28,9 +29,37 @@ export async function selectPdfPath(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
+export async function selectLibraryPath(): Promise<string | null> {
+  if (!runningInTauri()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    multiple: false,
+    directory: true,
+    title: "논문 폴더 선택",
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function scanLibraryFolder(
+  folderPath: string,
+): Promise<ScannedPdfFile[]> {
+  if (!runningInTauri()) {
+    throw new Error("폴더 스캔은 데스크톱 앱에서 사용할 수 있습니다.");
+  }
+  return invoke<ScannedPdfFile[]>("scan_pdf_directory", {
+    path: folderPath,
+  });
+}
+
 export function fileNameFromPath(filePath: string): string {
   const segments = filePath.split(/[\\/]/);
   return segments.at(-1) || "Untitled.pdf";
+}
+
+export function folderNameFromPath(folderPath: string): string {
+  const normalized = folderPath.replace(/[\\/]+$/, "");
+  const segments = normalized.split(/[\\/]/);
+  return segments.at(-1) || normalized;
 }
 
 export function stableDocumentId(filePath: string): string {
@@ -41,4 +70,3 @@ export function stableDocumentId(filePath: string): string {
   }
   return `doc_${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
-

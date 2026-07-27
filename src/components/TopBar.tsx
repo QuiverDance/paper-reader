@@ -4,12 +4,14 @@ import {
   ChevronLeft,
   ChevronRight,
   FilePlus2,
+  Languages,
   Maximize2,
   Minus,
   PanelTop,
   Plus,
   RotateCw,
   Search,
+  Settings2,
   Unlink2,
   ZoomIn,
 } from "lucide-react";
@@ -30,6 +32,9 @@ type TopBarProps = {
   onRotate: () => void;
   onSplitMode: (mode: SplitMode) => void;
   onToggleSync: () => void;
+  onTranslatePage: () => void;
+  onSettings: () => void;
+  translationRunning: boolean;
 };
 
 function IconButton({
@@ -73,6 +78,9 @@ export function TopBar({
   onRotate,
   onSplitMode,
   onToggleSync,
+  onTranslatePage,
+  onSettings,
+  translationRunning,
 }: TopBarProps) {
   const submitPage = (
     event: KeyboardEvent<HTMLInputElement> | ChangeEvent<HTMLInputElement>,
@@ -207,7 +215,24 @@ export function TopBar({
           {syncEnabled ? "동기화" : "독립 보기"}
         </button>
       </div>
+
+      <div className="toolbar-divider" />
+
+      <div className="toolbar-group">
+        <button
+          type="button"
+          className="translate-button"
+          disabled={!hasDocument || translationRunning}
+          onClick={onTranslatePage}
+          title="현재 페이지 번역"
+        >
+          <Languages size={16} />
+          {translationRunning ? "번역 중…" : "페이지 번역"}
+        </button>
+        <IconButton label="LLM 설정" onClick={onSettings}>
+          <Settings2 size={17} />
+        </IconButton>
+      </div>
     </header>
   );
 }
-
