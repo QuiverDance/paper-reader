@@ -128,6 +128,15 @@ function splitLongToken(token: string, font: PDFFont, size: number, width: numbe
   return chunks;
 }
 
+function canEncodeText(font: PDFFont, text: string, size: number): boolean {
+  try {
+    font.widthOfTextAtSize(text, size);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function wrapAcademicText(
   text: string,
   font: Pick<PDFFont, "widthOfTextAtSize">,
@@ -385,12 +394,25 @@ export async function createRetypesetPdf(
     width = columnWidth,
     x = columnX(state.column),
   ) => {
-    const lines = wrapAcademicText(text, font, size, width - indentFirst);
+    // PDF's built-in Latin fonts use WinAnsi and reject valid source
+    // characters such as ˇ. Keep their familiar appearance for encodable
+    // text, but fall back to the embedded Unicode fonts for the whole block.
+    const renderFont = canEncodeText(font, text, size)
+      ? font
+      : font === fonts.latinBody
+        ? fonts.koreanBody
+        : fonts.koreanSans;
+    const lines = wrapAcademicText(
+      text,
+      renderFont,
+      size,
+      width - indentFirst,
+    );
     for (let index = 0; index < lines.length; index += 1) {
       ensureHeight(lineHeight);
       const line = lines[index];
       const indent = index === 0 ? indentFirst : 0;
-      const lineWidth = font.widthOfTextAtSize(line, size);
+      const lineWidth = renderFont.widthOfTextAtSize(line, size);
       const drawX =
         align === "center"
           ? x + Math.max(0, (width - lineWidth) / 2)
@@ -399,7 +421,7 @@ export async function createRetypesetPdf(
         x: drawX,
         y: state.y - size,
         size,
-        font,
+        font: renderFont,
         color,
       });
       detectInlineLinks(
@@ -407,7 +429,7 @@ export async function createRetypesetPdf(
         line,
         drawX,
         state.y - size,
-        font,
+        renderFont,
         size,
         lineHeight,
         links,

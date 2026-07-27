@@ -31,7 +31,7 @@ function rectFromPdf(
 }
 
 describe.runIf(hasFonts)("re-typeset PDF integration", () => {
-  it("creates a searchable Korean derivative with vector source fragments", async () => {
+  it("creates a searchable Korean derivative with vector and non-WinAnsi source text", async () => {
     const source = await PDFDocument.create();
     const page = source.addPage([595, 842]);
     const serif = await source.embedFont(StandardFonts.TimesRoman);
@@ -136,7 +136,7 @@ describe.runIf(hasFonts)("re-typeset PDF integration", () => {
         documentId: "fixture",
         pageNumber: 1,
         type: "heading",
-        text: "1 Introduction",
+        text: "1 Introduction ˇ",
         bbox: rectFromPdf(55, 675, 120, 14),
         fontSize: 12,
         readingOrder: 3,
