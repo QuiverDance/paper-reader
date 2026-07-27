@@ -6,19 +6,26 @@ import {
   FileUp,
   LoaderCircle,
   LogIn,
+  Plus,
   RefreshCw,
   Save,
   TestTube2,
+  Trash2,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  applyModelProfile,
   getCodexAuthStatus,
+  normalizeLlmSettings,
   startCodexLogin,
   type CodexAuthStatus,
 } from "../lib/llm";
 import { importOpenCodeConfig } from "../lib/opencode-config";
-import type { LlmSettings } from "../types";
+import type {
+  LlmSettings,
+  ModelConnectionProfile,
+} from "../types";
 
 type SettingsDialogProps = {
   settings: LlmSettings;
@@ -35,7 +42,7 @@ export function SettingsDialog({
   onSave,
   onTest,
 }: SettingsDialogProps) {
-  const [draft, setDraft] = useState(settings);
+  const [draft, setDraft] = useState(() => normalizeLlmSettings(settings));
   const [showKey, setShowKey] = useState(false);
   const [configText, setConfigText] = useState("");
   const [importMessage, setImportMessage] = useState("");
@@ -43,7 +50,48 @@ export function SettingsDialog({
   const [codexBusy, setCodexBusy] = useState(false);
   const configFileRef = useRef<HTMLInputElement>(null);
 
-  const update = (key: keyof LlmSettings, value: string) => {
+  const activeProfile =
+    draft.profiles.find((profile) => profile.id === draft.activeProfileId) ??
+    draft.profiles[0];
+
+  const updateProfile = (changes: Partial<ModelConnectionProfile>) => {
+    setDraft((current) => {
+      const currentProfile =
+        current.profiles.find(
+          (profile) => profile.id === current.activeProfileId,
+        ) ?? current.profiles[0];
+      const nextProfile = { ...currentProfile, ...changes };
+      return applyModelProfile(
+        {
+          ...current,
+          profiles: current.profiles.map((profile) =>
+            profile.id === nextProfile.id ? nextProfile : profile,
+          ),
+        },
+        nextProfile,
+      );
+    });
+  };
+
+  const update = (
+    key:
+      | "endpoint"
+      | "apiKey"
+      | "model"
+      | "codexModel"
+      | "targetLanguage"
+      | "instructions",
+    value: string,
+  ) => {
+    if (
+      key === "endpoint" ||
+      key === "apiKey" ||
+      key === "model" ||
+      key === "codexModel"
+    ) {
+      updateProfile({ [key]: value });
+      return;
+    }
     setDraft((current) => ({ ...current, [key]: value }));
   };
 
@@ -90,7 +138,20 @@ export function SettingsDialog({
   const applyOpenCodeConfig = () => {
     try {
       const imported = importOpenCodeConfig(configText);
-      setDraft((current) => ({ ...current, ...imported }));
+      updateProfile({
+        connectionMode: "api",
+        endpoint: imported.endpoint,
+        apiKey: imported.apiKey,
+        model: imported.model,
+        maxContextSize: imported.maxContextSize ?? activeProfile.maxContextSize,
+        effort:
+          imported.effort === "low" ||
+          imported.effort === "high" ||
+          imported.effort === "max"
+            ? imported.effort
+            : activeProfile.effort,
+        capabilities: imported.capabilities ?? activeProfile.capabilities,
+      });
       setImportMessage(
         `${imported.modelAlias} → ${imported.model} (${imported.providerName}) 설정을 가져왔습니다.`,
       );
@@ -125,6 +186,81 @@ export function SettingsDialog({
           </button>
         </header>
 
+        <section className="profile-picker">
+          <label>
+            <span>연결 프로필</span>
+            <select
+              value={activeProfile.id}
+              onChange={(event) => {
+                const profile = draft.profiles.find(
+                  (candidate) => candidate.id === event.target.value,
+                );
+                if (profile) {
+                  setDraft((current) => applyModelProfile(current, profile));
+                }
+              }}
+            >
+              {draft.profiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name}
+                  {profile.beta ? " · 베타" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>프로필 이름</span>
+            <input
+              value={activeProfile.name}
+              onChange={(event) => updateProfile({ name: event.target.value })}
+            />
+          </label>
+          <div className="profile-actions">
+            <button
+              type="button"
+              className="secondary-action"
+              onClick={() => {
+                const id = `profile-${crypto.randomUUID()}`;
+                const profile: ModelConnectionProfile = {
+                  ...activeProfile,
+                  id,
+                  name: "새 모델 연결",
+                  apiKey: "",
+                  beta: false,
+                };
+                setDraft((current) =>
+                  applyModelProfile(
+                    { ...current, profiles: [...current.profiles, profile] },
+                    profile,
+                  ),
+                );
+              }}
+            >
+              <Plus size={14} />
+              새 프로필
+            </button>
+            <button
+              type="button"
+              className="secondary-action danger"
+              disabled={draft.profiles.length <= 1}
+              onClick={() => {
+                const remaining = draft.profiles.filter(
+                  (profile) => profile.id !== activeProfile.id,
+                );
+                setDraft((current) =>
+                  applyModelProfile(
+                    { ...current, profiles: remaining },
+                    remaining[0],
+                  ),
+                );
+              }}
+            >
+              <Trash2 size={14} />
+              삭제
+            </button>
+          </div>
+        </section>
+
         <div className="connection-tabs" role="tablist" aria-label="연결 방식">
           <button
             type="button"
@@ -132,10 +268,7 @@ export function SettingsDialog({
             aria-selected={draft.connectionMode === "api"}
             className={draft.connectionMode === "api" ? "active" : ""}
             onClick={() =>
-              setDraft((current) => ({
-                ...current,
-                connectionMode: "api",
-              }))
+              updateProfile({ connectionMode: "api", beta: false })
             }
           >
             API / OpenAI 호환
@@ -146,10 +279,7 @@ export function SettingsDialog({
             aria-selected={draft.connectionMode === "codex"}
             className={draft.connectionMode === "codex" ? "active" : ""}
             onClick={() =>
-              setDraft((current) => ({
-                ...current,
-                connectionMode: "codex",
-              }))
+              updateProfile({ connectionMode: "codex", beta: true })
             }
           >
             ChatGPT 로그인
@@ -250,6 +380,42 @@ model = "nvidia/GLM-5.2-NVFP4"`}
                 placeholder="nvidia/GLM-5.2-NVFP4"
               />
             </label>
+
+            <div className="settings-row">
+              <label>
+                <span>최대 컨텍스트</span>
+                <input
+                  type="number"
+                  min={4096}
+                  value={activeProfile.maxContextSize}
+                  onChange={(event) =>
+                    updateProfile({
+                      maxContextSize: Math.max(
+                        4096,
+                        Number(event.target.value) || 128000,
+                      ),
+                    })
+                  }
+                />
+              </label>
+              <label>
+                <span>추론 강도</span>
+                <select
+                  value={activeProfile.effort}
+                  onChange={(event) =>
+                    updateProfile({
+                      effort: event.target
+                        .value as ModelConnectionProfile["effort"],
+                    })
+                  }
+                >
+                  <option value="default">기본</option>
+                  <option value="low">낮음</option>
+                  <option value="high">높음</option>
+                  <option value="max">최대</option>
+                </select>
+              </label>
+            </div>
 
             <p className="settings-security">
               OpenCode 설정을 가져오면 기본 모델의 별칭을 따라 provider,
@@ -371,7 +537,7 @@ model = "nvidia/GLM-5.2-NVFP4"`}
           <button
             type="button"
             className="primary-action compact"
-            onClick={() => onSave(draft)}
+            onClick={() => onSave(normalizeLlmSettings(draft))}
           >
             <Save size={15} />
             저장

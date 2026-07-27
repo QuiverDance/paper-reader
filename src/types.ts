@@ -50,6 +50,8 @@ export type DocumentBlockType =
   | "figure-caption"
   | "table-caption"
   | "footnote"
+  | "equation"
+  | "reference-entry"
   | "unknown";
 
 export type DocumentBlock = {
@@ -75,6 +77,9 @@ export type TranslationRecord = {
   translatedText: string;
   status: TranslationStatus;
   error?: string;
+  sectionId?: string;
+  manuallyEdited?: boolean;
+  locked?: boolean;
   updatedAt: string;
 };
 
@@ -173,14 +178,33 @@ export type ScannedPdfFile = {
   fileHash: string;
 };
 
-export type LlmSettings = {
+export type ModelConnectionProfile = {
+  id: string;
+  name: string;
   connectionMode: "api" | "codex";
   endpoint: string;
   apiKey: string;
   model: string;
   codexModel: string;
+  maxContextSize: number;
+  effort: "default" | "low" | "high" | "max";
+  capabilities: string[];
+  beta?: boolean;
+};
+
+export type LlmSettings = {
+  profiles: ModelConnectionProfile[];
+  activeProfileId: string;
+  connectionMode: ModelConnectionProfile["connectionMode"];
+  endpoint: string;
+  apiKey: string;
+  model: string;
+  codexModel: string;
+  maxContextSize: number;
+  effort: ModelConnectionProfile["effort"];
   targetLanguage: string;
   instructions: string;
+  transmissionConsentKey?: string;
 };
 
 export type TextSelection = {
@@ -211,3 +235,75 @@ export type ReadingToolTab =
   | "notes"
   | "highlights"
   | "references";
+
+export type PaperSection = {
+  id: string;
+  title: string;
+  level: number;
+  parentId?: string;
+  headingBlockId?: string;
+  blockIds: string[];
+  childIds: string[];
+  topLevelId: string;
+};
+
+export type PaperAsset = {
+  id: string;
+  kind: "figure" | "table";
+  number: string;
+  captionBlockId: string;
+  pageNumber: number;
+  bbox: NormalizedRect;
+  sectionId: string;
+  contentBlockIds: string[];
+};
+
+export type SemanticPaper = {
+  documentId: string;
+  sections: PaperSection[];
+  assets: PaperAsset[];
+  blockSectionIds: Record<string, string>;
+  translatableBlockIds: string[];
+  preservedBlockIds: string[];
+  columnCount: 1 | 2;
+  bodyFontStyle: "serif" | "sans";
+  referenceHeadingBlockId?: string;
+};
+
+export type RetypesetWarningKind =
+  | "missing-translation"
+  | "damaged-asset"
+  | "damaged-equation"
+  | "broken-reference"
+  | "layout-overflow"
+  | "unsupported-source";
+
+export type RetypesetWarning = {
+  id: string;
+  severity: "integrity" | "visual";
+  kind: RetypesetWarningKind;
+  message: string;
+  blockId?: string;
+  acknowledged?: boolean;
+};
+
+export type RetypesetProject = {
+  id: string;
+  documentId: string;
+  targetLanguage: string;
+  profileId: string;
+  translationBrief: string;
+  manuallyEditedBlockIds: string[];
+  sourceFallbackBlockIds: string[];
+  acknowledgedWarningIds: string[];
+  createdAt: string;
+  updatedAt: string;
+  lastExportedAt?: string;
+};
+
+export type TypesettingPackageStatus = {
+  installed: boolean;
+  totalBytes: number;
+  installedBytes: number;
+  version: string;
+};

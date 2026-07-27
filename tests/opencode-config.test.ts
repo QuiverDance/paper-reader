@@ -29,6 +29,9 @@ describe("OpenCode config import", () => {
       model: "nvidia/GLM-5.2-NVFP4",
       providerName: "openai",
       modelAlias: "glm-5.2-nvfp4",
+      maxContextSize: 262144,
+      effort: "max",
+      capabilities: ["tool_use", "thinking"],
     });
   });
 

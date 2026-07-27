@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   DictionaryEntry,
   LlmSettings,
+  ModelConnectionProfile,
   TranslationRecord,
 } from "../types";
 import { runningInTauri } from "./platform";
@@ -32,17 +33,131 @@ export type CodexAuthStatus = {
 type CodexCompletionRequest = {
   messages: LlmMessage[];
   model?: string;
+  effort?: LlmSettings["effort"];
 };
 
 export const DEFAULT_LLM_SETTINGS: LlmSettings = {
+  profiles: [
+    {
+      id: "openai-default",
+      name: "OpenAI API",
+      connectionMode: "api",
+      endpoint: "https://api.openai.com/v1",
+      apiKey: "",
+      model: "gpt-4.1-mini",
+      codexModel: "",
+      maxContextSize: 128000,
+      effort: "default",
+      capabilities: [],
+    },
+  ],
+  activeProfileId: "openai-default",
   connectionMode: "api",
   endpoint: "https://api.openai.com/v1",
   apiKey: "",
   model: "gpt-4.1-mini",
   codexModel: "",
+  maxContextSize: 128000,
+  effort: "default",
   targetLanguage: "ko",
   instructions: "",
 };
+
+export function activeModelProfile(
+  settings: LlmSettings,
+): ModelConnectionProfile {
+  return (
+    settings.profiles.find(
+      (profile) => profile.id === settings.activeProfileId,
+    ) ?? {
+      id: settings.activeProfileId || "legacy-default",
+      name:
+        settings.connectionMode === "codex" ? "Codex 로그인" : "API 연결",
+      connectionMode: settings.connectionMode,
+      endpoint: settings.endpoint,
+      apiKey: settings.apiKey,
+      model: settings.model,
+      codexModel: settings.codexModel,
+      maxContextSize: settings.maxContextSize || 128000,
+      effort: settings.effort || "default",
+      capabilities: [],
+      beta: settings.connectionMode === "codex",
+    }
+  );
+}
+
+export function applyModelProfile(
+  settings: LlmSettings,
+  profile: ModelConnectionProfile,
+): LlmSettings {
+  return {
+    ...settings,
+    activeProfileId: profile.id,
+    connectionMode: profile.connectionMode,
+    endpoint: profile.endpoint,
+    apiKey: profile.apiKey,
+    model: profile.model,
+    codexModel: profile.codexModel,
+    maxContextSize: profile.maxContextSize,
+    effort: profile.effort,
+  };
+}
+
+export function modelConnectionSignature(settings: LlmSettings): string {
+  const profile = activeModelProfile(settings);
+  return [
+    profile.id,
+    profile.connectionMode,
+    profile.endpoint.trim(),
+    profile.model.trim(),
+    profile.codexModel.trim(),
+  ].join("|");
+}
+
+export function normalizeLlmSettings(
+  value: Partial<LlmSettings> = {},
+): LlmSettings {
+  const merged: LlmSettings = {
+    ...DEFAULT_LLM_SETTINGS,
+    ...value,
+    profiles: value.profiles?.length
+      ? value.profiles.map((profile) => ({
+          ...profile,
+          maxContextSize: profile.maxContextSize || 128000,
+          effort: profile.effort || "default",
+          capabilities: profile.capabilities ?? [],
+        }))
+      : [],
+  };
+  if (!merged.profiles.length) {
+    merged.profiles = [
+      {
+        id: merged.connectionMode === "codex" ? "codex-default" : "api-default",
+        name: merged.connectionMode === "codex" ? "Codex 로그인" : "API 연결",
+        connectionMode: merged.connectionMode,
+        endpoint: merged.endpoint,
+        apiKey: merged.apiKey,
+        model: merged.model,
+        codexModel: merged.codexModel,
+        maxContextSize: merged.maxContextSize || 128000,
+        effort: merged.effort || "default",
+        capabilities: [],
+        beta: merged.connectionMode === "codex",
+      },
+    ];
+  }
+  const active =
+    merged.profiles.find(
+      (profile) => profile.id === merged.activeProfileId,
+    ) ?? merged.profiles[0];
+  return applyModelProfile(
+    {
+      ...merged,
+      activeProfileId: active.id,
+    },
+    active,
+  );
+}
 
 function stripCodeFence(value: string): string {
   const trimmed = value.trim();
@@ -187,6 +302,7 @@ export async function completeChat(
       {
         messages,
         model: settings.codexModel.trim() || undefined,
+        effort: settings.effort,
       },
       signal,
     );
@@ -202,6 +318,7 @@ export async function completeChat(
         endpoint: chatCompletionsUrl(settings.endpoint),
         apiKey: settings.apiKey,
         model: settings.model,
+        effort: settings.effort,
         messages,
       },
     });
@@ -216,6 +333,7 @@ export async function completeChat(
       endpoint: chatCompletionsUrl(settings.endpoint),
       apiKey: settings.apiKey,
       model: settings.model,
+      effort: settings.effort,
       messages,
     }),
     signal,
@@ -247,6 +365,74 @@ export function translationMessages(
           "Use {blocks:[{id,translation}]} as the response shape.",
         ],
         blocks,
+      }),
+    },
+  ];
+}
+
+export function translationBriefMessages(
+  targetLanguage: string,
+  title: string,
+  sections: Array<{ title: string; text: string }>,
+  instructions = "",
+): LlmMessage[] {
+  return [
+    {
+      role: "system",
+      content:
+        "Create a compact translation brief for an academic paper. Identify domain, preferred terminology, voice, abbreviations, model and dataset names that must remain stable. Do not translate section headings. Return only valid JSON as {brief:string}.",
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        targetLanguage,
+        title,
+        instructions,
+        sections,
+      }),
+    },
+  ];
+}
+
+export function parseTranslationBriefResponse(value: string): string {
+  const payload = parseJsonObject(value);
+  if (typeof payload.brief !== "string" || !payload.brief.trim()) {
+    throw new Error("논문 번역 기준 응답에 brief 값이 없습니다.");
+  }
+  return payload.brief.trim();
+}
+
+export function sectionTranslationMessages(
+  targetLanguage: string,
+  section: {
+    id: string;
+    title: string;
+    subsections: string[];
+    blocks: Array<{ id: string; type: string; text: string }>;
+  },
+  brief: string,
+  instructions = "",
+): LlmMessage[] {
+  return [
+    {
+      role: "system",
+      content: [
+        "Translate academic prose faithfully and naturally as a Korean academic paper.",
+        "Translate body prose, explanatory footnotes, and captions only.",
+        "Do not translate section headings.",
+        "Preserve equations and citation markers exactly.",
+        "Render Figure N and Fig. N references as 그림 N, and Table N as 표 N, without changing N.",
+        "Do not summarize, omit, merge, or split input blocks.",
+        "Return only valid JSON as {blocks:[{id,translation}]}.",
+      ].join(" "),
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        targetLanguage,
+        translationBrief: brief,
+        instructions,
+        section,
       }),
     },
   ];
@@ -293,6 +479,7 @@ export function makeTranslationRecord(
   sourceText: string,
   translatedText: string,
   targetLanguage: string,
+  sectionId?: string,
 ): TranslationRecord {
   return {
     id: `${blockId}:${targetLanguage}`,
@@ -302,6 +489,9 @@ export function makeTranslationRecord(
     sourceText,
     translatedText,
     status: "translated",
+    sectionId,
+    manuallyEdited: false,
+    locked: false,
     updatedAt: new Date().toISOString(),
   };
 }

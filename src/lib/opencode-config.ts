@@ -15,6 +15,9 @@ type ProviderConfig = {
 type ModelConfig = {
   provider?: string;
   model?: string;
+  maxContextSize?: number;
+  effort?: LlmSettings["effort"];
+  capabilities?: string[];
 };
 
 export type OpenCodeImport = Pick<
@@ -23,7 +26,19 @@ export type OpenCodeImport = Pick<
 > & {
   providerName: string;
   modelAlias: string;
+  maxContextSize?: number;
+  effort?: LlmSettings["effort"];
+  capabilities?: string[];
 };
+
+function parseStringArray(rawValue: string): string[] {
+  const value = rawValue.trim();
+  if (!value.startsWith("[") || !value.endsWith("]")) return [];
+  return [...value.matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g)].map(
+    (match) =>
+      match[1] ? parseTomlString(`"${match[1]}"`) : match[2],
+  );
+}
 
 function stripInlineComment(line: string): string {
   let quote: '"' | "'" | null = null;
@@ -120,6 +135,19 @@ export function importOpenCodeConfig(source: string): OpenCodeImport {
       const model = models.get(section.name) ?? {};
       if (key === "provider") model.provider = value;
       if (key === "model") model.model = value;
+      if (key === "max_context_size") {
+        const parsed = Number(rawValue.trim());
+        if (Number.isFinite(parsed) && parsed > 0) model.maxContextSize = parsed;
+      }
+      if (
+        key === "default_effort" &&
+        (value === "low" || value === "high" || value === "max")
+      ) {
+        model.effort = value;
+      }
+      if (key === "capabilities") {
+        model.capabilities = parseStringArray(rawValue);
+      }
       models.set(section.name, model);
     }
   }
@@ -157,5 +185,8 @@ export function importOpenCodeConfig(source: string): OpenCodeImport {
     model: modelConfig.model,
     providerName,
     modelAlias: defaultModel,
+    maxContextSize: modelConfig.maxContextSize,
+    effort: modelConfig.effort,
+    capabilities: modelConfig.capabilities,
   };
 }

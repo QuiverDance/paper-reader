@@ -6,6 +6,7 @@ import type { DocumentReference } from "../types";
 type FigurePreviewProps = {
   document: PDFDocumentProxy;
   reference: DocumentReference;
+  translatedCaption?: string;
   onClose: () => void;
   onGoToPage: (pageNumber: number) => void;
 };
@@ -13,6 +14,7 @@ type FigurePreviewProps = {
 export function FigurePreview({
   document,
   reference,
+  translatedCaption,
   onClose,
   onGoToPage,
 }: FigurePreviewProps) {
@@ -80,6 +82,9 @@ export function FigurePreview({
             />
           )}
         </div>
+        {translatedCaption && (
+          <p className="figure-translated-caption">{translatedCaption}</p>
+        )}
         <footer>
           <span>p. {reference.targetPageNumber ?? "?"}</span>
           {reference.targetPageNumber && (

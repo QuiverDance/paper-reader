@@ -2,6 +2,7 @@ import {
   Bookmark,
   Check,
   Copy,
+  FileOutput,
   Languages,
   LoaderCircle,
   MessageSquareText,
@@ -56,6 +57,7 @@ type ToolRailProps = {
   error: string | null;
   onTab: (tab: ReadingToolTab) => void;
   onTranslate: (scope: TranslationScopeRequest) => void;
+  onOpenRetypeset: () => void;
   onCancelTranslation: () => void;
   onEditTranslation: (translation: TranslationRecord, text: string) => void;
   onAsk: (
@@ -106,6 +108,7 @@ export function ToolRail({
   error,
   onTab,
   onTranslate,
+  onOpenRetypeset,
   onCancelTranslation,
   onEditTranslation,
   onAsk,
@@ -292,6 +295,19 @@ export function ToolRail({
                 </div>
               )}
             </section>
+
+            <button
+              type="button"
+              className="retypeset-launch"
+              disabled={!hasDocument || !blocks.length}
+              onClick={onOpenRetypeset}
+            >
+              <FileOutput size={15} />
+              <span>
+                <strong>한국어 논문 PDF 만들기</strong>
+                <small>섹션 번역 · 새 조판 · 검수 · 내보내기</small>
+              </span>
+            </button>
 
             <section className="range-translation">
               <span>페이지 범위</span>

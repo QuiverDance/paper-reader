@@ -134,10 +134,19 @@ function classifyBlock(
   bbox: NormalizedRect,
 ): DocumentBlockType {
   const normalized = text.trim();
-  if (/^(fig(?:ure)?\.?)\s*\d+[a-z]?(?:[.:)\s]|$)/i.test(normalized)) {
+  const explicitFigureCaption =
+    /^(?:fig(?:ure)?\.?)\s*\d+[a-z]?\s*[.:)]/i.test(normalized);
+  const compactFigureLabel =
+    /^(?:fig(?:ure)?\.?)\s*\d+[a-z]?(?:\s|$)/i.test(normalized);
+  const explicitTableCaption =
+    /^table\s*\d+[a-z]?\s*[.:)]/i.test(normalized);
+  const compactTableLabel =
+    /^table\s*\d+[a-z]?(?:\s|$)/i.test(normalized);
+  const captionSized = fontSize <= medianFontSize * 0.85;
+  if (explicitFigureCaption || (compactFigureLabel && captionSized)) {
     return "figure-caption";
   }
-  if (/^table\s*\d+[a-z]?(?:[.:)\s]|$)/i.test(normalized)) {
+  if (explicitTableCaption || (compactTableLabel && captionSized)) {
     return "table-caption";
   }
   if (/^abstract(?:\s|$)/i.test(normalized)) return "abstract";
@@ -183,8 +192,8 @@ function shouldMergeLines(
   const indentationDelta = Math.abs(previous.minX - next.minX);
   const previousEndsSentence = /[.!?:]$/.test(previous.text);
   const specialLine =
-    /^(?:fig(?:ure)?\.?|table)\s*\d+/i.test(previous.text) ||
-    /^(?:fig(?:ure)?\.?|table)\s*\d+/i.test(next.text);
+    /^(?:fig(?:ure)?\.?|table)\s*\d+[a-z]?\s*[.:)]/i.test(previous.text) ||
+    /^(?:fig(?:ure)?\.?|table)\s*\d+[a-z]?\s*[.:)]/i.test(next.text);
   const structuralLine =
     /^(?:abstract|references|bibliography|acknowledg(?:e)?ments?)\s*$/i.test(
       previous.text,
@@ -267,7 +276,7 @@ export function groupPageTextItems(
     );
 
     return {
-      id: `${context.documentId}-p${context.pageNumber}-v2-b${readingOrder}`,
+      id: `${context.documentId}-p${context.pageNumber}-v5-b${readingOrder}`,
       documentId: context.documentId,
       pageNumber: context.pageNumber,
       type,

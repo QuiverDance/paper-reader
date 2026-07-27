@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import {
   AlertCircle,
@@ -25,9 +33,11 @@ import {
   resolveDocumentReferences,
 } from "./lib/document-blocks";
 import {
+  activeModelProfile,
   completeChat,
   dictionaryMessages,
   makeTranslationRecord,
+  modelConnectionSignature,
   parseDictionaryResponse,
   parseTranslationResponse,
   questionMessages,
@@ -44,6 +54,9 @@ import {
   selectPdfPath,
   stableDocumentId,
 } from "./lib/platform";
+import {
+  createRetypesetProject,
+} from "./lib/semantic-paper";
 import {
   DEFAULT_VIEW_STATE,
   mergeViewState,
@@ -63,6 +76,7 @@ import {
   listLibraryFolders,
   listNotes,
   listTranslations,
+  loadRetypesetProject,
   loadLlmSettings,
   makeReaderDocument,
   saveChatSession,
@@ -75,6 +89,7 @@ import {
   saveNote,
   saveTranslationJob,
   saveTranslations,
+  saveRetypesetProject,
   setDocumentTags,
   updateReadingState,
 } from "./lib/storage";
@@ -92,6 +107,7 @@ import type {
   PaneId,
   ReaderDocument,
   ReadingToolTab,
+  RetypesetProject,
   SplitMode,
   TextSelection,
   TranslationJob,
@@ -100,6 +116,12 @@ import type {
 } from "./types";
 
 type PaneStates = Record<PaneId, ViewState>;
+
+const RetypesetReviewDialog = lazy(() =>
+  import("./components/RetypesetReviewDialog").then((module) => ({
+    default: module.RetypesetReviewDialog,
+  })),
+);
 
 const INITIAL_PANE_STATES: PaneStates = {
   original: DEFAULT_VIEW_STATE,
@@ -160,12 +182,16 @@ function App() {
   const [asking, setAsking] = useState(false);
   const [streamingAnswer, setStreamingAnswer] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [retypesetOpen, setRetypesetOpen] = useState(false);
+  const [retypesetProject, setRetypesetProject] =
+    useState<RetypesetProject | null>(null);
   const [settingsTesting, setSettingsTesting] = useState(false);
   const [translationOverlay] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const browserInputRef = useRef<HTMLInputElement>(null);
   const currentPdfRef = useRef<PDFDocumentProxy | null>(null);
+  const currentPdfBytesRef = useRef<Uint8Array | null>(null);
   const currentDocumentIdRef = useRef<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const cancelTranslationRef = useRef(false);
@@ -303,14 +329,19 @@ function App() {
       setNotice(null);
       setSelection(null);
       setDictionaryEntry(null);
+      setRetypesetOpen(false);
+      setRetypesetProject(null);
       cancelTranslationRef.current = true;
       translationRunRef.current += 1;
       dictionaryRunRef.current += 1;
       questionRunRef.current += 1;
       try {
         const id = stableDocumentId(filePath);
+        // PDF.js transfers its input buffer to the worker. Keep an independent
+        // source copy for semantic reconstruction and export.
+        const sourceBytes = new Uint8Array(bytes);
         const [document, previous] = await Promise.all([
-          loadPdfDocument(bytes),
+          loadPdfDocument(new Uint8Array(sourceBytes)),
           findDocument(id),
         ]);
         currentDocumentIdRef.current = id;
@@ -337,6 +368,7 @@ function App() {
 
         const oldDocument = currentPdfRef.current;
         currentPdfRef.current = document;
+        currentPdfBytesRef.current = sourceBytes;
         setPdfDocument(document);
         setReaderDocument(nextReaderDocument);
         setPaneStates({ original: restored, companion: restored });
@@ -352,7 +384,7 @@ function App() {
         const savedBlocks = await hydrateDocumentData(id);
         const needsAnalysis =
           !savedBlocks.length ||
-          savedBlocks.some((block) => !block.id.includes("-v2-b"));
+          savedBlocks.some((block) => !block.id.includes("-v5-b"));
         if (needsAnalysis && nextReaderDocument.translationProgress) {
           const resetDocument = {
             ...nextReaderDocument,
@@ -778,6 +810,8 @@ function App() {
         translatedText: text.trim(),
         status: "translated" as const,
         error: undefined,
+        manuallyEdited: true,
+        locked: true,
         updatedAt: new Date().toISOString(),
       };
       setTranslations((current) =>
@@ -1063,6 +1097,47 @@ function App() {
     }
   }, []);
 
+  const openRetypesetReview = useCallback(async () => {
+    if (!readerDocument || !settings || !blocks.length) {
+      setError("텍스트 분석이 끝난 뒤 재조판할 수 있습니다.");
+      return;
+    }
+    const previous = await loadRetypesetProject(readerDocument.id);
+    const next = createRetypesetProject(
+      readerDocument.id,
+      settings.targetLanguage || "ko",
+      settings.activeProfileId,
+      previous,
+    );
+    await saveRetypesetProject(next);
+    setRetypesetProject(next);
+    setRetypesetOpen(true);
+  }, [blocks.length, readerDocument, settings]);
+
+  const requestTransmissionConsent = useCallback(async (): Promise<boolean> => {
+    if (!settings) return false;
+    const signature = modelConnectionSignature(settings);
+    if (settings.transmissionConsentKey === signature) return true;
+    const profile = activeModelProfile(settings);
+    const destination =
+      profile.connectionMode === "codex"
+        ? "이 PC의 Codex 로그인"
+        : `${profile.name} (${profile.endpoint})`;
+    const accepted = window.confirm(
+      [
+        `번역 대상 본문과 캡션을 ${destination}에 전송합니다.`,
+        "",
+        "PDF 파일, 그림·표 원본, 참고문헌은 전송하지 않습니다.",
+        "논문의 핵심 내용 대부분이 본문에 포함된다는 점을 확인해 주세요.",
+      ].join("\n"),
+    );
+    if (!accepted) return false;
+    const next = { ...settings, transmissionConsentKey: signature };
+    await saveLlmSettings(next);
+    setSettings(next);
+    return true;
+  }, [settings]);
+
   const statusText = useMemo(() => {
     if (!readerDocument) return "준비됨";
     const viewLabel =
@@ -1228,7 +1303,7 @@ function App() {
                   )}% · ${paneStates.original.rotation}° · 번역 ${Math.round(
                     (readerDocument.translationProgress ?? 0) * 100,
                   )}%`
-                : "Paperloom 0.2.0"}
+                : "Paperloom 0.3.0"}
             </span>
           </footer>
         </div>
@@ -1253,6 +1328,7 @@ function App() {
           error={null}
           onTab={setToolTab}
           onTranslate={(scope) => void startTranslation(scope)}
+          onOpenRetypeset={() => void openRetypesetReview()}
           onCancelTranslation={() => {
             cancelTranslationRef.current = true;
           }}
@@ -1330,6 +1406,13 @@ function App() {
         <FigurePreview
           document={pdfDocument}
           reference={selectedReference}
+          translatedCaption={
+            translations.find(
+              (translation) =>
+                translation.blockId === selectedReference.targetBlockId &&
+                translation.status === "translated",
+            )?.translatedText
+          }
           onClose={() => setSelectedReference(null)}
           onGoToPage={(pageNumber) => {
             setPage(pageNumber);
@@ -1337,6 +1420,39 @@ function App() {
           }}
         />
       )}
+
+      {retypesetOpen &&
+        retypesetProject &&
+        pdfDocument &&
+        currentPdfBytesRef.current &&
+        readerDocument &&
+        settings && (
+          <Suspense
+            fallback={
+              <div className="retypeset-backdrop">
+                <div className="global-loading">
+                  <LoaderCircle className="spin" size={22} />
+                  <span>재조판 도구를 준비하는 중</span>
+                </div>
+              </div>
+            }
+          >
+            <RetypesetReviewDialog
+              sourceDocument={pdfDocument}
+              sourceBytes={currentPdfBytesRef.current}
+              readerDocument={readerDocument}
+              blocks={blocks}
+              references={references}
+              translations={translations}
+              settings={settings}
+              project={retypesetProject}
+              onClose={() => setRetypesetOpen(false)}
+              onProject={setRetypesetProject}
+              onTranslations={setTranslations}
+              onRequestTransmissionConsent={requestTransmissionConsent}
+            />
+          </Suspense>
+        )}
     </div>
   );
 }

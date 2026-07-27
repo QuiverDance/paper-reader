@@ -74,6 +74,35 @@ describe("document block extraction", () => {
     ]);
   });
 
+  it("does not mistake a body sentence beginning with a figure reference for a caption", () => {
+    const blocks = groupPageTextItems(
+      [
+        {
+          str: "Figure 2 summarizes the experiment.",
+          x: 72,
+          y: 700,
+          width: 210,
+          height: 10,
+          fontSize: 10,
+        },
+        {
+          str: "Figure 2. Throughput by batch size.",
+          x: 72,
+          y: 140,
+          width: 210,
+          height: 8,
+          fontSize: 8,
+        },
+      ],
+      { documentId: "doc", pageNumber: 2, pageWidth: 600, pageHeight: 800 },
+    );
+
+    expect(blocks.map((block) => block.type)).toEqual([
+      "paragraph",
+      "figure-caption",
+    ]);
+  });
+
   it("keeps same-height text in separate columns", () => {
     const blocks = groupPageTextItems(
       [

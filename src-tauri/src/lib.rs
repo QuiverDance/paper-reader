@@ -7,7 +7,7 @@ use std::{
     process::{Command, Output, Stdio},
     time::SystemTime,
 };
-use tauri::ipc::Response;
+use tauri::{ipc::Response, Manager};
 use tauri_plugin_sql::{Migration, MigrationKind};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use walkdir::WalkDir;
@@ -40,6 +40,224 @@ fn read_pdf(path: String) -> Result<Response, String> {
     let path = validate_pdf_path(&path)?;
     let bytes = std::fs::read(path).map_err(|error| format!("PDF를 읽지 못했습니다: {error}"))?;
     Ok(Response::new(bytes))
+}
+
+const TYPESETTING_VERSION: &str = "nanum-korean-7ff85c8";
+const SERIF_FONT_URL: &str = "https://raw.githubusercontent.com/google/fonts/7ff85c87f93ea6cca5f41c69f2e4edcb90240f26/ofl/nanummyeongjo/NanumMyeongjo-Regular.ttf";
+const SANS_FONT_URL: &str = "https://raw.githubusercontent.com/google/fonts/7ff85c87f93ea6cca5f41c69f2e4edcb90240f26/ofl/nanumgothic/NanumGothic-Regular.ttf";
+const SERIF_FONT_SHA256: &str =
+    "7ed9e8653a8ed04285d51dc343ffea6eb3d9c73afc27383ea8929ee4ffd03205";
+const SANS_FONT_SHA256: &str =
+    "76f45ef4a6bcff344c837c95a7dcc26e017e38b5846d5ae0cdcb5b86be2e2d31";
+const SERIF_FONT_BYTES: u64 = 3_058_408;
+const SANS_FONT_BYTES: u64 = 2_054_744;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TypesettingPackageStatus {
+    installed: bool,
+    total_bytes: u64,
+    installed_bytes: u64,
+    version: String,
+}
+
+fn typesetting_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("앱 캐시 위치를 찾지 못했습니다: {error}"))?
+        .join("typesetting")
+        .join(TYPESETTING_VERSION);
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("한글 조판 패키지 폴더를 만들지 못했습니다: {error}"))?;
+    Ok(directory)
+}
+
+fn typesetting_font_path(app: &tauri::AppHandle, kind: &str) -> Result<PathBuf, String> {
+    let file_name = match kind {
+        "serif" => "NanumMyeongjo-Regular.ttf",
+        "sans" => "NanumGothic-Regular.ttf",
+        _ => return Err("지원하지 않는 조판 글꼴입니다.".to_string()),
+    };
+    Ok(typesetting_directory(app)?.join(file_name))
+}
+
+fn installed_font_bytes(path: &Path, expected: u64) -> u64 {
+    path.metadata()
+        .ok()
+        .filter(|metadata| metadata.is_file() && metadata.len() == expected)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn typesetting_status(app: &tauri::AppHandle) -> Result<TypesettingPackageStatus, String> {
+    let serif = installed_font_bytes(
+        &typesetting_font_path(app, "serif")?,
+        SERIF_FONT_BYTES,
+    );
+    let sans = installed_font_bytes(
+        &typesetting_font_path(app, "sans")?,
+        SANS_FONT_BYTES,
+    );
+    Ok(TypesettingPackageStatus {
+        installed: serif == SERIF_FONT_BYTES && sans == SANS_FONT_BYTES,
+        total_bytes: SERIF_FONT_BYTES + SANS_FONT_BYTES,
+        installed_bytes: serif + sans,
+        version: TYPESETTING_VERSION.to_string(),
+    })
+}
+
+#[tauri::command]
+fn typesetting_package_status(
+    app: tauri::AppHandle,
+) -> Result<TypesettingPackageStatus, String> {
+    typesetting_status(&app)
+}
+
+async fn download_font(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    if installed_font_bytes(destination, expected_size) == expected_size {
+        return Ok(());
+    }
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("한글 조판 글꼴을 받지 못했습니다: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "한글 조판 글꼴 다운로드가 실패했습니다 ({})",
+            response.status()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("한글 조판 글꼴을 읽지 못했습니다: {error}"))?;
+    if bytes.len() as u64 != expected_size {
+        return Err("받은 한글 조판 글꼴의 크기가 예상과 다릅니다.".to_string());
+    }
+    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if actual_sha256 != expected_sha256 {
+        return Err("받은 한글 조판 글꼴의 무결성 확인에 실패했습니다.".to_string());
+    }
+    let temporary = destination.with_extension("download");
+    fs::write(&temporary, &bytes)
+        .map_err(|error| format!("한글 조판 글꼴을 저장하지 못했습니다: {error}"))?;
+    if destination.exists() {
+        fs::remove_file(destination)
+            .map_err(|error| format!("기존 조판 글꼴을 교체하지 못했습니다: {error}"))?;
+    }
+    fs::rename(&temporary, destination)
+        .map_err(|error| format!("한글 조판 글꼴 설치를 완료하지 못했습니다: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn install_typesetting_package(
+    app: tauri::AppHandle,
+) -> Result<TypesettingPackageStatus, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|error| format!("다운로드 연결을 만들지 못했습니다: {error}"))?;
+    download_font(
+        &client,
+        SERIF_FONT_URL,
+        &typesetting_font_path(&app, "serif")?,
+        SERIF_FONT_BYTES,
+        SERIF_FONT_SHA256,
+    )
+    .await?;
+    download_font(
+        &client,
+        SANS_FONT_URL,
+        &typesetting_font_path(&app, "sans")?,
+        SANS_FONT_BYTES,
+        SANS_FONT_SHA256,
+    )
+    .await?;
+    typesetting_status(&app)
+}
+
+#[tauri::command]
+fn read_typesetting_font(app: tauri::AppHandle, kind: String) -> Result<Response, String> {
+    let path = typesetting_font_path(&app, &kind)?;
+    let bytes = fs::read(path)
+        .map_err(|_| "한글 조판 패키지를 먼저 설치해 주세요.".to_string())?;
+    Ok(Response::new(bytes))
+}
+
+#[tauri::command]
+fn write_generated_pdf(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let target = PathBuf::from(path);
+    let is_pdf = target
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false);
+    if !is_pdf {
+        return Err("PDF 확장자로 저장해 주세요.".to_string());
+    }
+    if bytes.len() < 5 || !bytes.starts_with(b"%PDF-") {
+        return Err("생성된 PDF 데이터가 올바르지 않습니다.".to_string());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| "저장 위치가 올바르지 않습니다.".to_string())?;
+    if !parent.is_dir() {
+        return Err("선택한 저장 폴더를 찾을 수 없습니다.".to_string());
+    }
+    fs::write(&target, bytes).map_err(|error| format!("PDF를 저장하지 못했습니다: {error}"))
+}
+
+fn validate_profile_id(profile_id: &str) -> Result<&str, String> {
+    let trimmed = profile_id.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 120
+        || !trimmed
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("모델 연결 프로필 식별자가 올바르지 않습니다.".to_string());
+    }
+    Ok(trimmed)
+}
+
+fn provider_secret_entry(profile_id: &str) -> Result<keyring::Entry, String> {
+    let account = validate_profile_id(profile_id)?;
+    keyring::Entry::new("paperloom.model-connection", account)
+        .map_err(|error| format!("운영체제 보안 저장소를 열지 못했습니다: {error}"))
+}
+
+#[tauri::command]
+fn store_provider_secret(profile_id: String, secret: String) -> Result<(), String> {
+    let entry = provider_secret_entry(&profile_id)?;
+    if secret.is_empty() {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(format!("기존 API 키를 지우지 못했습니다: {error}")),
+        }
+    } else {
+        entry
+            .set_password(&secret)
+            .map_err(|error| format!("API 키를 보안 저장소에 저장하지 못했습니다: {error}"))
+    }
+}
+
+#[tauri::command]
+fn read_provider_secret(profile_id: String) -> Result<Option<String>, String> {
+    let entry = provider_secret_entry(&profile_id)?;
+    match entry.get_password() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("API 키를 보안 저장소에서 읽지 못했습니다: {error}")),
+    }
 }
 
 #[derive(Serialize)]
@@ -140,6 +358,7 @@ struct LlmRequest {
     endpoint: String,
     api_key: String,
     model: String,
+    effort: Option<String>,
     messages: Vec<LlmMessage>,
 }
 
@@ -189,11 +408,22 @@ async fn llm_chat(request: LlmRequest) -> Result<String, String> {
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|_| "LLM HTTP client를 만들지 못했습니다.".to_string())?;
-    let mut request_builder = client.post(&request.endpoint).json(&serde_json::json!({
+    let mut payload = serde_json::json!({
         "model": request.model,
         "messages": request.messages,
         "stream": false
-    }));
+    });
+    if let Some(effort) = request
+        .effort
+        .as_deref()
+        .filter(|effort| *effort != "default")
+    {
+        if !matches!(effort, "low" | "high" | "max") {
+            return Err("지원하지 않는 추론 강도입니다.".to_string());
+        }
+        payload["reasoning_effort"] = serde_json::Value::String(effort.to_string());
+    }
+    let mut request_builder = client.post(&request.endpoint).json(&payload);
     if !request.api_key.trim().is_empty() {
         request_builder = request_builder.bearer_auth(&request.api_key);
     }
@@ -233,6 +463,7 @@ struct CodexAuthStatus {
 struct CodexCompletionRequest {
     messages: Vec<LlmMessage>,
     model: Option<String>,
+    effort: Option<String>,
 }
 
 struct CodexCommand {
@@ -424,6 +655,17 @@ async fn codex_complete(request: CodexCompletionRequest) -> Result<String, Strin
     if model.as_ref().is_some_and(|value| value.len() > 120) {
         return Err("Codex 모델명이 너무 깁니다.".to_string());
     }
+    let effort = request
+        .effort
+        .filter(|value| value != "default")
+        .map(|value| {
+            if matches!(value.as_str(), "low" | "high" | "max") {
+                Ok(value)
+            } else {
+                Err("지원하지 않는 Codex 추론 강도입니다.".to_string())
+            }
+        })
+        .transpose()?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let mut args = vec![
@@ -442,6 +684,10 @@ async fn codex_complete(request: CodexCompletionRequest) -> Result<String, Strin
         if let Some(value) = model {
             args.push("--model".to_string());
             args.push(value);
+        }
+        if let Some(value) = effort {
+            args.push("--config".to_string());
+            args.push(format!("model_reasoning_effort=\"{value}\""));
         }
         args.push("-".to_string());
 
@@ -619,6 +865,16 @@ pub fn run() {
         "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 3,
+            description: "retypeset_translation_state",
+            sql: r#"
+            ALTER TABLE translations ADD COLUMN section_id TEXT;
+            ALTER TABLE translations ADD COLUMN manually_edited INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE translations ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
+        "#,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -630,6 +886,12 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![
             read_pdf,
+            typesetting_package_status,
+            install_typesetting_package,
+            read_typesetting_font,
+            write_generated_pdf,
+            store_provider_secret,
+            read_provider_secret,
             scan_pdf_directory,
             llm_chat,
             codex_auth_status,

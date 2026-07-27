@@ -9,14 +9,20 @@ import type {
   LlmSettings,
   Note,
   ReaderDocument,
+  RetypesetProject,
   ScannedPdfFile,
   SplitMode,
   TranslationJob,
   TranslationRecord,
   ViewState,
 } from "../types";
-import { DEFAULT_LLM_SETTINGS } from "./llm";
-import { runningInTauri, stableDocumentId } from "./platform";
+import { DEFAULT_LLM_SETTINGS, normalizeLlmSettings } from "./llm";
+import {
+  readProviderSecret,
+  runningInTauri,
+  stableDocumentId,
+  storeProviderSecret,
+} from "./platform";
 import { DEFAULT_VIEW_STATE } from "./reader-state";
 
 const DATABASE_URL = "sqlite:paperloom.db";
@@ -51,6 +57,9 @@ type TranslationRow = {
   translated_text: string;
   status: TranslationRecord["status"];
   error: string | null;
+  section_id?: string | null;
+  manually_edited?: number | null;
+  locked?: number | null;
   updated_at: string;
 };
 
@@ -449,6 +458,9 @@ function rowToTranslation(row: TranslationRow): TranslationRecord {
     translatedText: row.translated_text,
     status: row.status,
     error: row.error ?? undefined,
+    sectionId: row.section_id ?? undefined,
+    manuallyEdited: Boolean(row.manually_edited),
+    locked: Boolean(row.locked),
     updatedAt: row.updated_at,
   };
 }
@@ -496,12 +508,16 @@ export async function saveTranslations(
       `INSERT INTO translations (
          id, document_id, block_id, target_language, source_text,
          translated_text, status, error, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         , section_id, manually_edited, locked
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT(id) DO UPDATE SET
          source_text = excluded.source_text,
          translated_text = excluded.translated_text,
          status = excluded.status,
          error = excluded.error,
+         section_id = excluded.section_id,
+         manually_edited = excluded.manually_edited,
+         locked = excluded.locked,
          updated_at = excluded.updated_at`,
       [
         translation.id,
@@ -513,6 +529,9 @@ export async function saveTranslations(
         translation.status,
         translation.error ?? null,
         translation.updatedAt,
+        translation.sectionId ?? null,
+        translation.manuallyEdited ? 1 : 0,
+        translation.locked ? 1 : 0,
       ],
     );
   }
@@ -929,23 +948,51 @@ export async function saveLibraryFolder(folder: LibraryFolder): Promise<void> {
 
 export async function loadLlmSettings(): Promise<LlmSettings> {
   if (!runningInTauri()) {
-    return {
-      ...DEFAULT_LLM_SETTINGS,
-      ...readBrowserValue<Partial<LlmSettings>>("llm-settings", {}),
-    };
+    return normalizeLlmSettings(
+      readBrowserValue<Partial<LlmSettings>>("llm-settings", {}),
+    );
   }
   const db = await getDatabase();
   const rows = await db.select<Array<{ value: string }>>(
     `SELECT value FROM settings WHERE key = 'llm' LIMIT 1`,
   );
-  if (!rows[0]) return DEFAULT_LLM_SETTINGS;
+  if (!rows[0]) return normalizeLlmSettings(DEFAULT_LLM_SETTINGS);
   try {
-    return {
-      ...DEFAULT_LLM_SETTINGS,
-      ...(JSON.parse(rows[0].value) as Partial<LlmSettings>),
-    };
+    const parsed = normalizeLlmSettings(
+      JSON.parse(rows[0].value) as Partial<LlmSettings>,
+    );
+    let migratedPlaintextSecret = false;
+    const profiles = await Promise.all(
+      parsed.profiles.map(async (profile) => {
+        const secured = await readProviderSecret(profile.id);
+        if (!secured && profile.apiKey) {
+          await storeProviderSecret(profile.id, profile.apiKey);
+          migratedPlaintextSecret = true;
+        }
+        return {
+          ...profile,
+          apiKey: secured || profile.apiKey || "",
+        };
+      }),
+    );
+    const hydrated = normalizeLlmSettings({ ...parsed, profiles });
+    if (migratedPlaintextSecret) {
+      const sanitized = normalizeLlmSettings({
+        ...hydrated,
+        apiKey: "",
+        profiles: hydrated.profiles.map((profile) => ({
+          ...profile,
+          apiKey: "",
+        })),
+      });
+      await db.execute(
+        `UPDATE settings SET value = $1, updated_at = $2 WHERE key = 'llm'`,
+        [JSON.stringify(sanitized), new Date().toISOString()],
+      );
+    }
+    return hydrated;
   } catch {
-    return DEFAULT_LLM_SETTINGS;
+    return normalizeLlmSettings(DEFAULT_LLM_SETTINGS);
   }
 }
 
@@ -954,6 +1001,20 @@ export async function saveLlmSettings(settings: LlmSettings): Promise<void> {
     writeBrowserValue("llm-settings", settings);
     return;
   }
+  const normalized = normalizeLlmSettings(settings);
+  await Promise.all(
+    normalized.profiles.map((profile) =>
+      storeProviderSecret(profile.id, profile.apiKey),
+    ),
+  );
+  const sanitized = normalizeLlmSettings({
+    ...normalized,
+    apiKey: "",
+    profiles: normalized.profiles.map((profile) => ({
+      ...profile,
+      apiKey: "",
+    })),
+  });
   const db = await getDatabase();
   await db.execute(
     `INSERT INTO settings (key, value, updated_at)
@@ -961,7 +1022,57 @@ export async function saveLlmSettings(settings: LlmSettings): Promise<void> {
      ON CONFLICT(key) DO UPDATE SET
        value = excluded.value,
        updated_at = excluded.updated_at`,
-    [JSON.stringify(settings), new Date().toISOString()],
+    [JSON.stringify(sanitized), new Date().toISOString()],
   );
 }
 
+export async function loadRetypesetProject(
+  documentId: string,
+): Promise<RetypesetProject | null> {
+  if (!runningInTauri()) {
+    return (
+      readBrowserValue<Record<string, RetypesetProject>>(
+        "retypeset-projects",
+        {},
+      )[documentId] ?? null
+    );
+  }
+  const db = await getDatabase();
+  const rows = await db.select<Array<{ value: string }>>(
+    `SELECT value FROM settings WHERE key = $1 LIMIT 1`,
+    [`retypeset:${documentId}`],
+  );
+  if (!rows[0]) return null;
+  try {
+    return JSON.parse(rows[0].value) as RetypesetProject;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveRetypesetProject(
+  project: RetypesetProject,
+): Promise<void> {
+  if (!runningInTauri()) {
+    const projects = readBrowserValue<Record<string, RetypesetProject>>(
+      "retypeset-projects",
+      {},
+    );
+    projects[project.documentId] = project;
+    writeBrowserValue("retypeset-projects", projects);
+    return;
+  }
+  const db = await getDatabase();
+  await db.execute(
+    `INSERT INTO settings (key, value, updated_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at`,
+    [
+      `retypeset:${project.documentId}`,
+      JSON.stringify(project),
+      project.updatedAt,
+    ],
+  );
+}

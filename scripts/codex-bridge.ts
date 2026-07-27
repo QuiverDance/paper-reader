@@ -150,11 +150,16 @@ function messagePrompt(messages: CodexMessage[]): string {
 function parseMessages(payload: unknown): {
   messages: CodexMessage[];
   model?: string;
+  effort?: "low" | "high" | "max";
 } {
   if (!payload || typeof payload !== "object") {
     throw new Error("Codex 요청 형식이 올바르지 않습니다.");
   }
-  const candidate = payload as { messages?: unknown; model?: unknown };
+  const candidate = payload as {
+    messages?: unknown;
+    model?: unknown;
+    effort?: unknown;
+  };
   if (!Array.isArray(candidate.messages) || candidate.messages.length === 0) {
     throw new Error("Codex 요청에 대화 내용이 없습니다.");
   }
@@ -195,13 +200,20 @@ function parseMessages(payload: unknown): {
   if (model && model.length > 120) {
     throw new Error("Codex 모델명이 너무 깁니다.");
   }
-  return { messages, model };
+  const effort =
+    candidate.effort === "low" ||
+    candidate.effort === "high" ||
+    candidate.effort === "max"
+      ? candidate.effort
+      : undefined;
+  return { messages, model, effort };
 }
 
 function parseApiRequest(payload: unknown): {
   endpoint: string;
   apiKey: string;
   model: string;
+  effort?: "low" | "high" | "max";
   messages: CodexMessage[];
 } {
   const { messages } = parseMessages(payload);
@@ -209,6 +221,7 @@ function parseApiRequest(payload: unknown): {
     endpoint?: unknown;
     apiKey?: unknown;
     model?: unknown;
+    effort?: unknown;
   };
   if (typeof candidate.endpoint !== "string") {
     throw new Error("API endpoint가 필요합니다.");
@@ -243,19 +256,30 @@ function parseApiRequest(payload: unknown): {
     endpoint: endpoint.toString(),
     apiKey: candidate.apiKey ?? "",
     model: candidate.model.trim(),
+    effort:
+      candidate.effort === "low" ||
+      candidate.effort === "high" ||
+      candidate.effort === "max"
+        ? candidate.effort
+        : undefined,
     messages,
   };
 }
 
 async function completeWithApi(payload: unknown): Promise<string> {
-  const { endpoint, apiKey, model, messages } = parseApiRequest(payload);
+  const { endpoint, apiKey, model, effort, messages } = parseApiRequest(payload);
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey}` } : {}),
     },
-    body: JSON.stringify({ model, messages, stream: false }),
+    body: JSON.stringify({
+      model,
+      messages,
+      stream: false,
+      ...(effort ? { reasoning_effort: effort } : {}),
+    }),
     signal: AbortSignal.timeout(120_000),
   });
   const responsePayload = (await response.json().catch(() => null)) as {
@@ -354,7 +378,9 @@ export function codexBridge(projectRoot = process.cwd()): Plugin {
       }
 
       if (request.method === "POST" && path === `${ROUTE_PREFIX}/complete`) {
-        const { messages, model } = parseMessages(await readJsonBody(request));
+        const { messages, model, effort } = parseMessages(
+          await readJsonBody(request),
+        );
         const args = [
           "exec",
           "--sandbox",
@@ -369,6 +395,9 @@ export function codexBridge(projectRoot = process.cwd()): Plugin {
           workingDirectory,
         ];
         if (model) args.push("--model", model);
+        if (effort) {
+          args.push("--config", `model_reasoning_effort="${effort}"`);
+        }
         args.push("-");
 
         const result = await runCodex(codexEntry, args, {

@@ -502,6 +502,7 @@ export function PdfPane({
                         event.stopPropagation();
                         onReference(reference);
                       }}
+                      onMouseEnter={() => onReference(reference)}
                       title={`${reference.label} 미리보기`}
                     >
                       <ScanSearch size={12} />

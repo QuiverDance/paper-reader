@@ -40,6 +40,50 @@ export async function selectLibraryPath(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
+export async function saveGeneratedPdf(
+  bytes: Uint8Array,
+  suggestedName: string,
+): Promise<string | null> {
+  if (!runningInTauri()) {
+    const blob = new Blob([new Uint8Array(bytes)], {
+      type: "application/pdf",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = suggestedName;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return suggestedName;
+  }
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const path = await save({
+    defaultPath: suggestedName,
+    filters: [{ name: "PDF document", extensions: ["pdf"] }],
+  });
+  if (!path) return null;
+  await invoke("write_generated_pdf", {
+    path,
+    bytes: Array.from(bytes),
+  });
+  return path;
+}
+
+export async function storeProviderSecret(
+  profileId: string,
+  secret: string,
+): Promise<void> {
+  if (!runningInTauri()) return;
+  await invoke("store_provider_secret", { profileId, secret });
+}
+
+export async function readProviderSecret(
+  profileId: string,
+): Promise<string> {
+  if (!runningInTauri()) return "";
+  return (await invoke<string | null>("read_provider_secret", { profileId })) ?? "";
+}
+
 export async function scanLibraryFolder(
   folderPath: string,
 ): Promise<ScannedPdfFile[]> {
