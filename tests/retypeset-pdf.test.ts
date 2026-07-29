@@ -7,9 +7,15 @@ import {
   isStandaloneMarker,
   justifiedLineSegments,
   localizeDocumentReferenceLabels,
+  planRetypesetContent,
   usesWholeBlockBoldFont,
 } from "../src/lib/retypeset-pdf";
-import type { DocumentBlock } from "../src/types";
+import { createRetypesetProject } from "../src/lib/semantic-paper";
+import type {
+  DocumentBlock,
+  SemanticPaper,
+  TranslationRecord,
+} from "../src/types";
 
 describe("re-typeset front matter", () => {
   it("visually scales Korean body type below the source Latin point size", () => {
@@ -161,5 +167,96 @@ describe("re-typeset front matter", () => {
       right: 304,
       top: 564,
     });
+  });
+
+  it("plans content once and keeps the best translation for each block", () => {
+    const blocks: DocumentBlock[] = [
+      {
+        id: "caption",
+        documentId: "paper",
+        pageNumber: 2,
+        type: "figure-caption",
+        text: "Figure 1: Result.",
+        bbox: { x: 0.1, y: 0.3, width: 0.4, height: 0.04 },
+        readingOrder: 2,
+        translatable: true,
+      },
+      {
+        id: "body",
+        documentId: "paper",
+        pageNumber: 2,
+        type: "paragraph",
+        text: "Body.",
+        bbox: { x: 0.1, y: 0.4, width: 0.4, height: 0.04 },
+        readingOrder: 1,
+        translatable: true,
+      },
+    ];
+    const paper: SemanticPaper = {
+      documentId: "paper",
+      contentStartPage: 2,
+      sections: [],
+      assets: [
+        {
+          id: "figure-1",
+          kind: "figure",
+          number: "1",
+          captionBlockId: "caption",
+          pageNumber: 2,
+          bbox: { x: 0.1, y: 0.1, width: 0.4, height: 0.2 },
+          sectionId: "root",
+          contentBlockIds: ["chart-label"],
+        },
+      ],
+      blockSectionIds: {},
+      translatableBlockIds: ["body", "caption"],
+      preservedBlockIds: [],
+      columnCount: 2,
+      bodyFontStyle: "serif",
+    };
+    const project = createRetypesetProject("paper", "ko", "profile");
+    const translation = (
+      id: string,
+      status: TranslationRecord["status"],
+      text: string,
+      updatedAt: string,
+    ): TranslationRecord => ({
+      id,
+      documentId: "paper",
+      blockId: "body",
+      targetLanguage: "ko",
+      sourceText: "Body.",
+      translatedText: text,
+      status,
+      updatedAt,
+    });
+
+    const plan = planRetypesetContent(
+      blocks,
+      paper,
+      [
+        translation(
+          "translated",
+          "translated",
+          "정상 번역",
+          "2026-07-28T00:00:00.000Z",
+        ),
+        translation(
+          "newer-failure",
+          "failed",
+          "",
+          "2026-07-29T00:00:00.000Z",
+        ),
+      ],
+      project,
+    );
+
+    expect(plan.orderedBlocks.map((block) => block.id)).toEqual([
+      "body",
+      "caption",
+    ]);
+    expect(plan.translationByBlock.get("body")?.id).toBe("translated");
+    expect(plan.assetsByCaption.get("caption")?.id).toBe("figure-1");
+    expect(plan.assetContentBlockIds.has("chart-label")).toBe(true);
   });
 });

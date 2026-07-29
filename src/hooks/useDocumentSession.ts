@@ -1,23 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import { extractDocumentBlocks } from "../lib/document-blocks";
 import {
   analyzeDocumentSession,
   loadDocumentSessionBundle,
   needsDocumentAnalysis,
   prepareDocumentSession,
   type DocumentSessionBundle,
-  type DocumentSessionDependencies,
 } from "../lib/document-session-workflow";
+import { documentSessionDependencies } from "../lib/document-session-runtime";
 import { applyModelProfile } from "../lib/llm";
-import { extractPdfTitle, loadPdfDocument } from "../lib/pdf";
 import {
-  documentIdFromHash,
-  hashPdfBytes,
   readPdfFromPath,
   runningInTauri,
   selectPdfPath,
-  stableDocumentId,
 } from "../lib/platform";
 import {
   DEFAULT_VIEW_STATE,
@@ -26,17 +21,8 @@ import {
 import {
   deleteHighlight,
   deleteNote,
-  findDocumentByIdentity,
-  listChatSessions,
-  listDocumentBlocks,
-  listHighlights,
-  listNotes,
   listRecentDocuments,
-  listTranslations,
-  loadRetypesetProject,
-  makeReaderDocument,
   saveDocument,
-  saveDocumentBlocks,
   saveHighlight,
   saveLlmSettings,
   saveNote,
@@ -57,24 +43,6 @@ type PaneStates = Record<PaneId, ViewState>;
 const INITIAL_PANE_STATES: PaneStates = {
   original: DEFAULT_VIEW_STATE,
   companion: DEFAULT_VIEW_STATE,
-};
-
-const dependencies: DocumentSessionDependencies = {
-  hashBytes: hashPdfBytes,
-  stableId: stableDocumentId,
-  idFromHash: documentIdFromHash,
-  loadPdf: loadPdfDocument,
-  findByIdentity: findDocumentByIdentity,
-  extractTitle: extractPdfTitle,
-  makeDocument: makeReaderDocument,
-  listBlocks: listDocumentBlocks,
-  listTranslations,
-  listHighlights,
-  listNotes,
-  listSessions: listChatSessions,
-  loadProject: loadRetypesetProject,
-  extractBlocks: extractDocumentBlocks,
-  saveBlocks: saveDocumentBlocks,
 };
 
 type UseDocumentSessionOptions = {
@@ -180,7 +148,7 @@ export function useDocumentSession({
         const extracted = await analyzeDocumentSession(
           pdf,
           documentId,
-          dependencies,
+          documentSessionDependencies,
           isCurrent,
           setAnalysisProgress,
         );
@@ -222,7 +190,7 @@ export function useDocumentSession({
         const prepared = await prepareDocumentSession(
           bytes,
           filePath,
-          dependencies,
+          documentSessionDependencies,
         );
         if (!isLatestRun()) {
           void prepared.pdf.cleanup();
@@ -280,7 +248,7 @@ export function useDocumentSession({
         await saveDocument(prepared.document);
         const bundle = await loadDocumentSessionBundle(
           documentId,
-          dependencies,
+          documentSessionDependencies,
           () =>
             isLatestRun() &&
             activeDocumentIdRef.current === documentId,

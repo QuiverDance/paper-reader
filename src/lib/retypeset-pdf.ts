@@ -392,9 +392,9 @@ export function justifiedLineSegments(
 
 function blockText(
   block: DocumentBlock,
-  translations: Map<string, TranslationRecord>,
+  translations: ReadonlyMap<string, TranslationRecord>,
   project: RetypesetProject,
-  translatable: Set<string>,
+  translatable: ReadonlySet<string>,
 ): { text: string; translated: boolean; missing: boolean } {
   if (!translatable.has(block.id)) {
     return { text: block.text, translated: false, missing: false };
@@ -522,6 +522,99 @@ function referenceDestination(block: DocumentBlock): string | null {
   return match ? `reference:${match[1]}` : null;
 }
 
+export type RetypesetContentPlan = {
+  orderedBlocks: DocumentBlock[];
+  translationByBlock: ReadonlyMap<string, TranslationRecord>;
+  translatableBlockIds: ReadonlySet<string>;
+  continuationBlockIds: ReadonlySet<string>;
+  assetsByCaption: ReadonlyMap<string, PaperAsset>;
+  assetContentBlockIds: ReadonlySet<string>;
+  frontMatterRect: NormalizedRect | null;
+  frontMatterBlockIds: ReadonlySet<string>;
+};
+
+function prefersTranslation(
+  candidate: TranslationRecord,
+  current: TranslationRecord,
+): boolean {
+  const statusRank = (record: TranslationRecord) =>
+    record.status === "translated" ? 2 : record.status === "pending" ? 1 : 0;
+  return (
+    statusRank(candidate) > statusRank(current) ||
+    (statusRank(candidate) === statusRank(current) &&
+      candidate.updatedAt.localeCompare(current.updatedAt) > 0)
+  );
+}
+
+export function planRetypesetContent(
+  blocks: DocumentBlock[],
+  paper: SemanticPaper,
+  translations: TranslationRecord[],
+  project: RetypesetProject,
+): RetypesetContentPlan {
+  const translationByBlock = new Map<string, TranslationRecord>();
+  for (const translation of translations) {
+    if (translation.targetLanguage !== project.targetLanguage) continue;
+    const current = translationByBlock.get(translation.blockId);
+    if (!current || prefersTranslation(translation, current)) {
+      translationByBlock.set(translation.blockId, translation);
+    }
+  }
+  const translatableBlockIds = new Set(paper.translatableBlockIds);
+  const lockedBlockIds = new Set(
+    translations
+      .filter(
+        (item) =>
+          item.targetLanguage === project.targetLanguage && item.locked,
+      )
+      .map((item) => item.blockId),
+  );
+  const continuationBlockIds = new Set(
+    translationParagraphsForPaper(
+      blocks,
+      paper.translatableBlockIds,
+      lockedBlockIds,
+    ).flatMap((paragraph) => paragraph.blockIds.slice(1)),
+  );
+  const assetsByCaption = new Map(
+    paper.assets.map((asset) => [asset.captionBlockId, asset]),
+  );
+  const assetContentBlockIds = new Set(
+    paper.assets.flatMap((asset) => asset.contentBlockIds),
+  );
+  const frontMatterRect = inferFrontMatterRect(
+    blocks,
+    paper.contentStartPage,
+  );
+  const frontMatterBlockIds = new Set(
+    frontMatterRect
+      ? blocks
+          .filter(
+            (block) =>
+              block.pageNumber === paper.contentStartPage &&
+              (block.type === "title" || block.type === "authors"),
+          )
+          .map((block) => block.id)
+      : [],
+  );
+  const orderedBlocks = [...blocks].sort(
+    (left, right) =>
+      left.pageNumber - right.pageNumber ||
+      left.readingOrder - right.readingOrder,
+  );
+
+  return {
+    orderedBlocks,
+    translationByBlock,
+    translatableBlockIds,
+    continuationBlockIds,
+    assetsByCaption,
+    assetContentBlockIds,
+    frontMatterRect,
+    frontMatterBlockIds,
+  };
+}
+
 export async function createRetypesetPdf(
   options: RetypesetPdfOptions,
 ): Promise<RetypesetPdfResult> {
@@ -589,51 +682,20 @@ export async function createRetypesetPdf(
   const returnLinks: LinkPosition[] = [];
   const destinations = new Map<string, Destination>();
   const firstReferences = new Map<string, Destination>();
-  const blockById = new Map(blocks.map((block) => [block.id, block]));
-  const translationByBlock = new Map(
-    translations
-      .filter((item) => item.targetLanguage === project.targetLanguage)
-      .map((item) => [item.blockId, item]),
-  );
-  const translatable = new Set(paper.translatableBlockIds);
-  const lockedBlockIds = new Set(
-    translations
-      .filter(
-        (item) =>
-          item.targetLanguage === project.targetLanguage && item.locked,
-      )
-      .map((item) => item.blockId),
-  );
-  const translationParagraphs = translationParagraphsForPaper(
+  const {
+    orderedBlocks,
+    translationByBlock,
+    translatableBlockIds: translatable,
+    continuationBlockIds,
+    assetsByCaption,
+    assetContentBlockIds,
+    frontMatterRect,
+    frontMatterBlockIds,
+  } = planRetypesetContent(
     blocks,
-    paper.translatableBlockIds,
-    lockedBlockIds,
-  );
-  const continuationBlockIds = new Set(
-    translationParagraphs.flatMap((paragraph) =>
-      paragraph.blockIds.slice(1),
-    ),
-  );
-  const assetsByCaption = new Map(
-    paper.assets.map((asset) => [asset.captionBlockId, asset]),
-  );
-  const assetContentBlockIds = new Set(
-    paper.assets.flatMap((asset) => asset.contentBlockIds),
-  );
-  const frontMatterRect = inferFrontMatterRect(
-    blocks,
-    paper.contentStartPage,
-  );
-  const frontMatterBlockIds = new Set(
-    frontMatterRect
-      ? blocks
-          .filter(
-            (block) =>
-              block.pageNumber === paper.contentStartPage &&
-              (block.type === "title" || block.type === "authors"),
-          )
-          .map((block) => block.id)
-      : [],
+    paper,
+    translations,
+    project,
   );
   const leadingPageCount = Math.max(
     0,
@@ -1222,16 +1284,11 @@ export async function createRetypesetPdf(
     anchoredCaptionIds.add(block.id);
   }
 
-  const ordered = [...blocks].sort(
-    (left, right) =>
-      left.pageNumber - right.pageNumber ||
-      left.readingOrder - right.readingOrder,
-  );
   const drawnAssets = new Set<string>(registeredAssetIds);
   let frontMatterDrawn = frontMatterRegistered;
   let frontMatterFallback = false;
 
-  for (const block of ordered) {
+  for (const block of orderedBlocks) {
     if (
       block.pageNumber < paper.contentStartPage ||
       block.type === "running-header" ||

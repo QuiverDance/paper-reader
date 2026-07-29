@@ -32,13 +32,10 @@ import { useKoreanPaperCreation } from "./hooks/useKoreanPaperCreation";
 import { useModelSettings } from "./hooks/useModelSettings";
 import { usePaperAsk } from "./hooks/usePaperAsk";
 import {
-  detectDocumentReferences,
-  resolveDocumentReferences,
-} from "./lib/document-blocks";
-import { referencePreviewCaption } from "./lib/reference-preview";
+  buildReferenceCatalog,
+  buildSourceReferenceIndex,
+} from "./lib/reference-catalog";
 import { observeClearedTextSelection } from "./lib/selection-toolbar";
-import { analyzeSemanticPaper } from "./lib/semantic-paper";
-import { translationParagraphsForPaper } from "./lib/translation-paragraphs";
 import type {
   AnnotationSource,
   DocumentReference,
@@ -119,56 +116,12 @@ function App() {
     onError: setError,
   });
 
-  const resolvedReferences = useMemo(
-    () =>
-      resolveDocumentReferences(
-        blocks,
-        detectDocumentReferences(blocks, { language: "source" }),
-      ),
+  const sourceReferenceIndex = useMemo(
+    () => buildSourceReferenceIndex(blocks),
     [blocks],
   );
-  const semanticPaper = useMemo(
-    () => analyzeSemanticPaper(blocks, resolvedReferences),
-    [blocks, resolvedReferences],
-  );
-  const references = useMemo(
-    () =>
-      resolvedReferences.map((reference) => {
-        const asset = semanticPaper.assets.find(
-          (candidate) =>
-            candidate.kind === reference.kind &&
-            candidate.number.toLowerCase() === reference.number.toLowerCase(),
-        );
-        if (asset) {
-          return {
-            ...reference,
-            targetBlockId: asset.captionBlockId,
-            targetPageNumber: asset.pageNumber,
-            targetBbox: asset.bbox,
-          };
-        }
-        if (reference.kind === "code") {
-          const code = blocks.find(
-            (block) =>
-              block.type === "code-listing" &&
-              new RegExp(
-                `^(?:Algorithm|Listing|Code)\\s*${reference.number}\\b`,
-                "i",
-              ).test(block.text.trim()),
-          );
-          if (code) {
-            return {
-              ...reference,
-              targetBlockId: code.id,
-              targetPageNumber: code.pageNumber,
-              targetBbox: code.bbox,
-            };
-          }
-        }
-        return reference;
-      }),
-    [blocks, resolvedReferences, semanticPaper.assets],
-  );
+  const semanticPaper = sourceReferenceIndex.paper;
+  const references = sourceReferenceIndex.references;
   const {
     document: koreanDocument,
     blocks: koreanBlocks,
@@ -218,36 +171,16 @@ function App() {
     onError: setError,
     onNotice: setNotice,
   });
-  const koreanReferences = useMemo(
+  const referenceCatalog = useMemo(
     () =>
-      resolveDocumentReferences(
-        koreanBlocks,
-        detectDocumentReferences(koreanBlocks, { language: "translation" }),
-      ).map((reference) => {
-        const source = references.find(
-          (candidate) =>
-            candidate.kind === reference.kind &&
-            candidate.number.toLowerCase() === reference.number.toLowerCase(),
-        );
-        return source
-          ? {
-              ...reference,
-              targetBlockId: source.targetBlockId,
-              targetPageNumber: source.targetPageNumber,
-              targetBbox: source.targetBbox,
-            }
-          : reference;
+      buildReferenceCatalog({
+        source: sourceReferenceIndex,
+        translatedBlocks: koreanBlocks,
+        translations,
       }),
-    [koreanBlocks, references],
+    [koreanBlocks, sourceReferenceIndex, translations],
   );
-  const referenceTranslationParagraphs = useMemo(
-    () =>
-      translationParagraphsForPaper(
-        blocks,
-        semanticPaper.translatableBlockIds,
-      ),
-    [blocks, semanticPaper.translatableBlockIds],
-  );
+  const koreanReferences = referenceCatalog.translation;
   const activateAsk = useCallback(() => setToolTab("ask"), []);
   const {
     sessions,
@@ -683,15 +616,10 @@ function App() {
           document={pdfDocument}
           reference={selectedReference.reference}
           anchor={selectedReference.anchor}
-          caption={referencePreviewCaption({
-            surface: selectedReference.surface,
-            reference: selectedReference.reference,
-            sourceReferences: references,
-            sourceBlocks: blocks,
-            translatedBlocks: koreanBlocks,
-            translations,
-            translationParagraphs: referenceTranslationParagraphs,
-          })}
+          caption={referenceCatalog.previewCaption(
+            selectedReference.reference,
+            selectedReference.surface,
+          )}
           onEnter={keepReferencePreviewOpen}
           onLeave={scheduleReferencePreviewClose}
           onGoToPage={(pageNumber) => {

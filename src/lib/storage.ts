@@ -14,6 +14,7 @@ import type {
   ViewState,
 } from "../types";
 import { DEFAULT_LLM_SETTINGS, normalizeLlmSettings } from "./llm";
+import { browserPaperRepository } from "./browser-paper-repository";
 import {
   readProviderSecret,
   runningInTauri,
@@ -22,7 +23,6 @@ import {
 import { DEFAULT_VIEW_STATE } from "./reader-state";
 
 const DATABASE_URL = "sqlite:paperloom.db";
-const STORAGE_PREFIX = "paperloom.";
 
 type DocumentRow = {
   id: string;
@@ -62,19 +62,6 @@ type TranslationRow = {
 };
 
 let databasePromise: Promise<Database> | null = null;
-
-function readBrowserValue<T>(key: string, fallback: T): T {
-  try {
-    const value = localStorage.getItem(`${STORAGE_PREFIX}${key}`);
-    return value ? (JSON.parse(value) as T) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function writeBrowserValue<T>(key: string, value: T): void {
-  localStorage.setItem(`${STORAGE_PREFIX}${key}`, JSON.stringify(value));
-}
 
 function rowToDocument(row: DocumentRow): ReaderDocument {
   return {
@@ -119,19 +106,9 @@ const DOCUMENT_SELECT = `
          ), '') AS tags
     FROM documents d`;
 
-function browserDocuments(): ReaderDocument[] {
-  return readBrowserValue<ReaderDocument[]>("documents", []);
-}
-
-function writeBrowserDocuments(documents: ReaderDocument[]): void {
-  writeBrowserValue("documents", documents.slice(0, 1000));
-}
-
 export async function listRecentDocuments(): Promise<ReaderDocument[]> {
   if (!runningInTauri()) {
-    return browserDocuments()
-      .sort((left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt))
-      .slice(0, 20);
+    return browserPaperRepository().listRecentDocuments();
   }
   const db = await getDatabase();
   const rows = await db.select<DocumentRow[]>(
@@ -145,13 +122,7 @@ export async function findDocumentByIdentity(
   legacyId?: string,
 ): Promise<ReaderDocument | null> {
   if (!runningInTauri()) {
-    return (
-      browserDocuments().find((document) => document.fileHash === fileHash) ??
-      (legacyId
-        ? browserDocuments().find((document) => document.id === legacyId)
-        : undefined) ??
-      null
-    );
+    return browserPaperRepository().findDocumentByIdentity(fileHash, legacyId);
   }
   const db = await getDatabase();
   const rows = await db.select<DocumentRow[]>(
@@ -166,13 +137,7 @@ export async function findDocumentByIdentity(
 
 export async function saveDocument(document: ReaderDocument): Promise<void> {
   if (!runningInTauri()) {
-    const documents = browserDocuments().filter(
-      (candidate) =>
-        candidate.id !== document.id &&
-        candidate.filePath !== document.filePath,
-    );
-    writeBrowserDocuments([{ ...document, missing: false }, ...documents]);
-    return;
+    return browserPaperRepository().saveDocument(document);
   }
 
   const db = await getDatabase();
@@ -239,20 +204,12 @@ export async function updateReadingState(
 ): Promise<void> {
   const now = new Date().toISOString();
   if (!runningInTauri()) {
-    writeBrowserDocuments(
-      browserDocuments().map((document) =>
-        document.id === id
-          ? {
-              ...document,
-              viewState,
-              splitMode,
-              syncEnabled,
-              lastOpenedAt: now,
-            }
-          : document,
-      ),
+    return browserPaperRepository().updateReadingState(
+      id,
+      viewState,
+      splitMode,
+      syncEnabled,
     );
-    return;
   }
   const db = await getDatabase();
   await db.execute(
@@ -307,10 +264,7 @@ export async function saveDocumentBlocks(
   blocks: DocumentBlock[],
 ): Promise<void> {
   if (!runningInTauri()) {
-    const all = readBrowserValue<Record<string, DocumentBlock[]>>("blocks", {});
-    all[documentId] = blocks;
-    writeBrowserValue("blocks", all);
-    return;
+    return browserPaperRepository().saveDocumentBlocks(documentId, blocks);
   }
   const db = await getDatabase();
   await db.execute(`DELETE FROM document_blocks WHERE document_id = $1`, [
@@ -341,9 +295,7 @@ export async function listDocumentBlocks(
   documentId: string,
 ): Promise<DocumentBlock[]> {
   if (!runningInTauri()) {
-    return readBrowserValue<Record<string, DocumentBlock[]>>("blocks", {})[
-      documentId
-    ] ?? [];
+    return browserPaperRepository().listDocumentBlocks(documentId);
   }
   const db = await getDatabase();
   const rows = await db.select<
@@ -399,10 +351,9 @@ export async function listTranslations(
   targetLanguage?: string,
 ): Promise<TranslationRecord[]> {
   if (!runningInTauri()) {
-    return readBrowserValue<TranslationRecord[]>("translations", []).filter(
-      (translation) =>
-        translation.documentId === documentId &&
-        (!targetLanguage || translation.targetLanguage === targetLanguage),
+    return browserPaperRepository().listTranslations(
+      documentId,
+      targetLanguage,
     );
   }
   const db = await getDatabase();
@@ -421,15 +372,7 @@ export async function saveTranslations(
 ): Promise<void> {
   if (!translations.length) return;
   if (!runningInTauri()) {
-    const byId = new Map(
-      readBrowserValue<TranslationRecord[]>("translations", []).map((item) => [
-        item.id,
-        item,
-      ]),
-    );
-    for (const translation of translations) byId.set(translation.id, translation);
-    writeBrowserValue("translations", [...byId.values()]);
-    return;
+    return browserPaperRepository().saveTranslations(translations);
   }
   const db = await getDatabase();
   for (const translation of translations) {
@@ -470,9 +413,7 @@ export async function listHighlights(
   documentId: string,
 ): Promise<Highlight[]> {
   if (!runningInTauri()) {
-    return readBrowserValue<Highlight[]>("highlights", []).filter(
-      (highlight) => highlight.documentId === documentId,
-    );
+    return browserPaperRepository().listHighlights(documentId);
   }
   const db = await getDatabase();
   const rows = await db.select<
@@ -503,12 +444,7 @@ export async function listHighlights(
 
 export async function saveHighlight(highlight: Highlight): Promise<void> {
   if (!runningInTauri()) {
-    const highlights = readBrowserValue<Highlight[]>("highlights", []);
-    writeBrowserValue("highlights", [
-      highlight,
-      ...highlights.filter((candidate) => candidate.id !== highlight.id),
-    ]);
-    return;
+    return browserPaperRepository().saveHighlight(highlight);
   }
   const db = await getDatabase();
   await db.execute(
@@ -531,13 +467,7 @@ export async function saveHighlight(highlight: Highlight): Promise<void> {
 
 export async function deleteHighlight(id: string): Promise<void> {
   if (!runningInTauri()) {
-    writeBrowserValue(
-      "highlights",
-      readBrowserValue<Highlight[]>("highlights", []).filter(
-        (highlight) => highlight.id !== id,
-      ),
-    );
-    return;
+    return browserPaperRepository().deleteHighlight(id);
   }
   const db = await getDatabase();
   await db.execute(`DELETE FROM highlights WHERE id = $1`, [id]);
@@ -545,9 +475,7 @@ export async function deleteHighlight(id: string): Promise<void> {
 
 export async function listNotes(documentId: string): Promise<Note[]> {
   if (!runningInTauri()) {
-    return readBrowserValue<Note[]>("notes", []).filter(
-      (note) => note.documentId === documentId,
-    );
+    return browserPaperRepository().listNotes(documentId);
   }
   const db = await getDatabase();
   const rows = await db.select<
@@ -586,12 +514,7 @@ export async function listNotes(documentId: string): Promise<Note[]> {
 
 export async function saveNote(note: Note): Promise<void> {
   if (!runningInTauri()) {
-    const notes = readBrowserValue<Note[]>("notes", []);
-    writeBrowserValue("notes", [
-      note,
-      ...notes.filter((candidate) => candidate.id !== note.id),
-    ]);
-    return;
+    return browserPaperRepository().saveNote(note);
   }
   const db = await getDatabase();
   await db.execute(
@@ -617,11 +540,7 @@ export async function saveNote(note: Note): Promise<void> {
 
 export async function deleteNote(id: string): Promise<void> {
   if (!runningInTauri()) {
-    writeBrowserValue(
-      "notes",
-      readBrowserValue<Note[]>("notes", []).filter((note) => note.id !== id),
-    );
-    return;
+    return browserPaperRepository().deleteNote(id);
   }
   const db = await getDatabase();
   await db.execute(`DELETE FROM notes WHERE id = $1`, [id]);
@@ -633,13 +552,10 @@ export async function findDictionaryEntry(
   context: string,
 ): Promise<DictionaryEntry | null> {
   if (!runningInTauri()) {
-    return (
-      readBrowserValue<DictionaryEntry[]>("dictionary", []).find(
-        (entry) =>
-          entry.documentId === documentId &&
-          entry.word.toLocaleLowerCase() === word.toLocaleLowerCase() &&
-          entry.context === context,
-      ) ?? null
+    return browserPaperRepository().findDictionaryEntry(
+      documentId,
+      word,
+      context,
     );
   }
   const db = await getDatabase();
@@ -683,12 +599,7 @@ export async function saveDictionaryEntry(
   entry: DictionaryEntry,
 ): Promise<void> {
   if (!runningInTauri()) {
-    const entries = readBrowserValue<DictionaryEntry[]>("dictionary", []);
-    writeBrowserValue("dictionary", [
-      entry,
-      ...entries.filter((candidate) => candidate.id !== entry.id),
-    ]);
-    return;
+    return browserPaperRepository().saveDictionaryEntry(entry);
   }
   const db = await getDatabase();
   await db.execute(
@@ -715,9 +626,7 @@ export async function listChatSessions(
   documentId: string,
 ): Promise<ChatSession[]> {
   if (!runningInTauri()) {
-    return readBrowserValue<ChatSession[]>("chat-sessions", []).filter(
-      (session) => session.documentId === documentId,
-    );
+    return browserPaperRepository().listChatSessions(documentId);
   }
   const db = await getDatabase();
   const sessions = await db.select<
@@ -772,12 +681,7 @@ export async function listChatSessions(
 
 export async function saveChatSession(session: ChatSession): Promise<void> {
   if (!runningInTauri()) {
-    const sessions = readBrowserValue<ChatSession[]>("chat-sessions", []);
-    writeBrowserValue("chat-sessions", [
-      session,
-      ...sessions.filter((candidate) => candidate.id !== session.id),
-    ]);
-    return;
+    return browserPaperRepository().saveChatSession(session);
   }
   const db = await getDatabase();
   await db.execute(
@@ -814,9 +718,7 @@ export async function saveChatSession(session: ChatSession): Promise<void> {
 
 export async function loadLlmSettings(): Promise<LlmSettings> {
   if (!runningInTauri()) {
-    return normalizeLlmSettings(
-      readBrowserValue<Partial<LlmSettings>>("llm-settings", {}),
-    );
+    return browserPaperRepository().loadLlmSettings();
   }
   const db = await getDatabase();
   const rows = await db.select<Array<{ value: string }>>(
@@ -864,8 +766,7 @@ export async function loadLlmSettings(): Promise<LlmSettings> {
 
 export async function saveLlmSettings(settings: LlmSettings): Promise<void> {
   if (!runningInTauri()) {
-    writeBrowserValue("llm-settings", settings);
-    return;
+    return browserPaperRepository().saveLlmSettings(settings);
   }
   const normalized = normalizeLlmSettings(settings);
   await Promise.all(
@@ -896,12 +797,7 @@ export async function loadRetypesetProject(
   documentId: string,
 ): Promise<RetypesetProject | null> {
   if (!runningInTauri()) {
-    return (
-      readBrowserValue<Record<string, RetypesetProject>>(
-        "retypeset-projects",
-        {},
-      )[documentId] ?? null
-    );
+    return browserPaperRepository().loadRetypesetProject(documentId);
   }
   const db = await getDatabase();
   const rows = await db.select<Array<{ value: string }>>(
@@ -920,13 +816,7 @@ export async function saveRetypesetProject(
   project: RetypesetProject,
 ): Promise<void> {
   if (!runningInTauri()) {
-    const projects = readBrowserValue<Record<string, RetypesetProject>>(
-      "retypeset-projects",
-      {},
-    );
-    projects[project.documentId] = project;
-    writeBrowserValue("retypeset-projects", projects);
-    return;
+    return browserPaperRepository().saveRetypesetProject(project);
   }
   const db = await getDatabase();
   await db.execute(
