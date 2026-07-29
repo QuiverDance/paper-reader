@@ -1,19 +1,34 @@
 import type {
   DocumentBlock,
   LlmSettings,
+  LlmTokenUsage,
   PaperSection,
   RetypesetProject,
   SemanticPaper,
   TranslationRecord,
 } from "../types";
 import {
-  completeChat,
+  completeChatWithUsage,
   makeTranslationRecord,
   parseTranslationBriefResponse,
   parseTranslationResponse,
   sectionTranslationMessages,
   translationBriefMessages,
 } from "./llm";
+import {
+  addTokenUsage,
+  EMPTY_TOKEN_USAGE,
+  usageByPhase,
+} from "./token-usage";
+import {
+  groupTranslationParagraphs,
+  translationSourceText,
+  type TranslationParagraph,
+} from "./translation-paragraphs";
+export {
+  groupTranslationParagraphs,
+  type TranslationParagraph,
+} from "./translation-paragraphs";
 
 type TranslationCheckpoint = {
   sectionId: string;
@@ -21,6 +36,7 @@ type TranslationCheckpoint = {
   total: number;
   records: TranslationRecord[];
   project: RetypesetProject;
+  usage: LlmTokenUsage;
 };
 
 type TranslatePaperOptions = {
@@ -30,9 +46,31 @@ type TranslatePaperOptions = {
   settings: LlmSettings;
   project: RetypesetProject;
   existingTranslations: TranslationRecord[];
+  forceRetranslate?: boolean;
   signal?: AbortSignal;
   onCheckpoint?: (checkpoint: TranslationCheckpoint) => void | Promise<void>;
 };
+
+export function translationNeedsRefresh(
+  record: TranslationRecord | undefined,
+  sectionId: string,
+  forceRetranslate = false,
+  sourceText?: string,
+): boolean {
+  if (
+    !record ||
+    record.status !== "translated" ||
+    !record.translatedText.trim()
+  ) {
+    return true;
+  }
+  if (record.locked) return false;
+  if (forceRetranslate) return true;
+  return (
+    record.sectionId !== sectionId ||
+    (sourceText !== undefined && record.sourceText !== sourceText)
+  );
+}
 
 type SectionUnit = {
   id: string;
@@ -48,6 +86,8 @@ type ProtectedText = {
 
 const CITATION_PATTERN =
   /\[[^\]\n]{0,90}\d[^\]\n]{0,90}\]|\([^()\n]{0,100}(?:19|20)\d{2}[a-z]?[^()\n]{0,80}\)/gi;
+const INLINE_MATH_PATTERN =
+  /(?:[A-Za-z]|[Α-Ωα-ω])\s*=\s*[A-Za-zΑ-Ωα-ω0-9]+(?:\s*[·×*/+\-−]\s*[A-Za-zΑ-Ωα-ω0-9]+){0,4}/g;
 
 function orderedBlocks(blocks: DocumentBlock[]): DocumentBlock[] {
   return [...blocks].sort(
@@ -58,20 +98,28 @@ function orderedBlocks(blocks: DocumentBlock[]): DocumentBlock[] {
 }
 
 function sourceForTranslation(block: DocumentBlock): string {
-  if (block.type === "abstract") {
-    return block.text.replace(/^abstract(?:\s*[:.—-]\s*|\s+)/i, "").trim();
-  }
-  return block.text.trim();
+  return translationSourceText(block);
 }
 
-export function protectCitations(text: string): ProtectedText {
+export function protectCitations(
+  text: string,
+  tokenNamespace = "",
+): ProtectedText {
   const markers: ProtectedText["markers"] = [];
   const protectedText = text.replace(CITATION_PATTERN, (source) => {
-    const token = `⟦CITATION_${markers.length + 1}⟧`;
+    const token = `⟦${tokenNamespace}CITATION_${markers.length + 1}⟧`;
     markers.push({ token, source });
     return token;
   });
-  return { text: protectedText, markers };
+  const protectedMath = protectedText.replace(
+    INLINE_MATH_PATTERN,
+    (source) => {
+      const token = `⟦${tokenNamespace}MATH_${markers.length + 1}⟧`;
+      markers.push({ token, source });
+      return token;
+    },
+  );
+  return { text: protectedMath, markers };
 }
 
 export function restoreProtectedText(
@@ -232,6 +280,7 @@ function briefSections(
 
 function failedRecord(
   block: DocumentBlock,
+  sourceText: string,
   targetLanguage: string,
   sectionId: string,
   error: string,
@@ -241,7 +290,7 @@ function failedRecord(
     documentId: block.documentId,
     blockId: block.id,
     targetLanguage,
-    sourceText: block.text,
+    sourceText,
     translatedText: "",
     status: "failed",
     error,
@@ -252,6 +301,25 @@ function failedRecord(
   };
 }
 
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let nextIndex = 0;
+  const runners = Array.from(
+    { length: Math.min(Math.max(1, concurrency), items.length) },
+    async () => {
+      while (nextIndex < items.length) {
+        const item = items[nextIndex];
+        nextIndex += 1;
+        await worker(item);
+      }
+    },
+  );
+  await Promise.all(runners);
+}
+
 export async function translatePaperSections({
   title,
   paper,
@@ -259,23 +327,37 @@ export async function translatePaperSections({
   settings,
   project,
   existingTranslations,
+  forceRetranslate = false,
   signal,
   onCheckpoint,
 }: TranslatePaperOptions): Promise<{
   project: RetypesetProject;
   translations: TranslationRecord[];
   failedSectionIds: string[];
+  usage: LlmTokenUsage;
 }> {
   const workingProject = { ...project };
+  let usage =
+    workingProject.tokenUsage?.translation ?? EMPTY_TOKEN_USAGE;
+  const updateProjectUsage = () => {
+    workingProject.tokenUsage = usageByPhase(
+      workingProject.documentStructure?.usage,
+      usage,
+    );
+  };
+  updateProjectUsage();
+  const validRecordIds = new Set(paper.translatableBlockIds);
   const recordsByBlock = new Map(
-    existingTranslations.map((record) => [record.blockId, record]),
+    existingTranslations
+      .filter((record) => validRecordIds.has(record.blockId))
+      .map((record) => [record.blockId, record]),
   );
   const sourceBlocks = paper.translatableBlockIds
     .map((id) => blocks.find((block) => block.id === id))
     .filter((block): block is DocumentBlock => Boolean(block));
 
   if (!workingProject.translationBrief.trim()) {
-    const briefResponse = await completeChat(
+    const briefResponse = await completeChatWithUsage(
       settings,
       translationBriefMessages(
         settings.targetLanguage,
@@ -291,8 +373,10 @@ export async function translatePaperSections({
       ),
       signal,
     );
+    usage = addTokenUsage(usage, briefResponse.usage);
+    updateProjectUsage();
     workingProject.translationBrief =
-      parseTranslationBriefResponse(briefResponse);
+      parseTranslationBriefResponse(briefResponse.content);
     workingProject.updatedAt = new Date().toISOString();
   }
 
@@ -303,37 +387,68 @@ export async function translatePaperSections({
   );
   const failedSectionIds: string[] = [];
   let completed = 0;
-
-  for (const unit of units) {
-    if (signal?.aborted) throw new DOMException("번역이 취소되었습니다.", "AbortError");
-    const pending = unit.blocks.filter((block) => {
-      const record = recordsByBlock.get(block.id);
-      return !(
-        record?.status === "translated" &&
-        record.translatedText.trim() &&
-        (record.locked || record.sectionId === unit.id)
-      );
+  let checkpointQueue = Promise.resolve();
+  const checkpoint = (sectionId: string): Promise<void> => {
+    completed += 1;
+    workingProject.updatedAt = new Date().toISOString();
+    const snapshot: TranslationCheckpoint = {
+      sectionId,
+      completed,
+      total: units.length,
+      records: [...recordsByBlock.values()],
+      project: { ...workingProject },
+      usage,
+    };
+    checkpointQueue = checkpointQueue.then(async () => {
+      await onCheckpoint?.(snapshot);
     });
+    return checkpointQueue;
+  };
+
+  await runWithConcurrency(units, 3, async (unit) => {
+    if (signal?.aborted) throw new DOMException("번역이 취소되었습니다.", "AbortError");
+    const blockById = new Map(unit.blocks.map((block) => [block.id, block]));
+    const lockedBlockIds = new Set(
+      unit.blocks
+        .filter((block) => recordsByBlock.get(block.id)?.locked)
+        .map((block) => block.id),
+    );
+    const pending = groupTranslationParagraphs(
+      unit.blocks,
+      lockedBlockIds,
+    ).filter(
+      (paragraph) => {
+        const record = recordsByBlock.get(paragraph.id);
+        return translationNeedsRefresh(
+          record,
+          unit.id,
+          forceRetranslate,
+          paragraph.text,
+        );
+      },
+    );
     if (!pending.length) {
-      completed += 1;
-      await onCheckpoint?.({
-        sectionId: unit.id,
-        completed,
-        total: units.length,
-        records: [...recordsByBlock.values()],
-        project: workingProject,
-      });
-      continue;
+      await checkpoint(unit.id);
+      return;
     }
 
-    const protectedByBlock = new Map(
-      pending.map((block) => [
-        block.id,
-        protectCitations(sourceForTranslation(block)),
+    const protectedByParagraph = new Map(
+      pending.map((paragraph) => [
+        paragraph.id,
+        protectCitations(
+          paragraph.text,
+          `${paragraph.id.replace(/[^A-Za-z0-9]/g, "_")}_`,
+        ),
       ]),
     );
+    const logicalParagraphs: TranslationParagraph[] = pending.map(
+      (paragraph) => ({
+        ...paragraph,
+        text: protectedByParagraph.get(paragraph.id)!.text,
+      }),
+    );
     try {
-      const response = await completeChat(
+      const response = await completeChatWithUsage(
         settings,
         sectionTranslationMessages(
           settings.targetLanguage,
@@ -341,66 +456,78 @@ export async function translatePaperSections({
             id: unit.id,
             title: unit.title,
             subsections: unit.subsectionTitles,
-            blocks: pending.map((block) => ({
-              id: block.id,
-              type: block.type,
-              text: protectedByBlock.get(block.id)!.text,
+            blocks: pending.map((paragraph) => ({
+              id: paragraph.id,
+              type: blockById.get(paragraph.id)!.type,
+              text: protectedByParagraph.get(paragraph.id)!.text,
             })),
+            logicalParagraphs,
           },
           workingProject.translationBrief,
           settings.instructions,
         ),
         signal,
       );
+      usage = addTokenUsage(usage, response.usage);
+      updateProjectUsage();
       const translated = parseTranslationResponse(
-        response,
-        pending.map((block) => block.id),
+        response.content,
+        pending.map((paragraph) => paragraph.id),
       );
       for (const result of translated) {
-        const block = pending.find((candidate) => candidate.id === result.blockId)!;
+        const paragraph = pending.find(
+          (candidate) => candidate.id === result.blockId,
+        )!;
+        const block = blockById.get(paragraph.id)!;
         const restored = restoreProtectedText(
           result.text,
-          protectedByBlock.get(result.blockId)!.markers,
+          protectedByParagraph.get(result.blockId)!.markers,
         );
         recordsByBlock.set(
           result.blockId,
           makeTranslationRecord(
             block.documentId,
             block.id,
-            block.text,
+            paragraph.text,
             restored,
             settings.targetLanguage,
             unit.id,
           ),
         );
+        for (const followerId of paragraph.blockIds.slice(1)) {
+          recordsByBlock.delete(followerId);
+        }
       }
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       failedSectionIds.push(unit.id);
-      for (const block of pending) {
-        const current = recordsByBlock.get(block.id);
+      for (const paragraph of pending) {
+        const block = blockById.get(paragraph.id)!;
+        const current = recordsByBlock.get(paragraph.id);
         if (current?.locked) continue;
         recordsByBlock.set(
-          block.id,
-          failedRecord(block, settings.targetLanguage, unit.id, message),
+          paragraph.id,
+          failedRecord(
+            block,
+            paragraph.text,
+            settings.targetLanguage,
+            unit.id,
+            message,
+          ),
         );
       }
     }
 
-    completed += 1;
-    workingProject.updatedAt = new Date().toISOString();
-    await onCheckpoint?.({
-      sectionId: unit.id,
-      completed,
-      total: units.length,
-      records: [...recordsByBlock.values()],
-      project: workingProject,
-    });
-  }
+    await checkpoint(unit.id);
+  });
 
+  const failed = new Set(failedSectionIds);
   return {
     project: workingProject,
     translations: [...recordsByBlock.values()],
-    failedSectionIds,
+    usage,
+    failedSectionIds: units
+      .map((unit) => unit.id)
+      .filter((sectionId) => failed.has(sectionId)),
   };
 }

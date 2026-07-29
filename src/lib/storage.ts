@@ -5,14 +5,11 @@ import type {
   DictionaryEntry,
   DocumentBlock,
   Highlight,
-  LibraryFolder,
   LlmSettings,
   Note,
   ReaderDocument,
   RetypesetProject,
-  ScannedPdfFile,
   SplitMode,
-  TranslationJob,
   TranslationRecord,
   ViewState,
 } from "../types";
@@ -20,7 +17,6 @@ import { DEFAULT_LLM_SETTINGS, normalizeLlmSettings } from "./llm";
 import {
   readProviderSecret,
   runningInTauri,
-  stableDocumentId,
   storeProviderSecret,
 } from "./platform";
 import { DEFAULT_VIEW_STATE } from "./reader-state";
@@ -46,6 +42,8 @@ type DocumentRow = {
   missing?: number | null;
   translation_progress?: number | null;
   tags?: string | null;
+  active_profile_id?: string | null;
+  reasoning_effort?: ReaderDocument["reasoningEffort"] | null;
 };
 
 type TranslationRow = {
@@ -99,6 +97,8 @@ function rowToDocument(row: DocumentRow): ReaderDocument {
     missing: Boolean(row.missing),
     tags: row.tags ? row.tags.split("\u001f").filter(Boolean) : [],
     translationProgress: row.translation_progress ?? 0,
+    activeProfileId: row.active_profile_id ?? undefined,
+    reasoningEffort: row.reasoning_effort ?? undefined,
   };
 }
 
@@ -111,7 +111,7 @@ const DOCUMENT_SELECT = `
   SELECT d.id, d.file_path, d.title, d.page_count, d.last_opened_at,
          d.page_number, d.relative_offset_y, d.scale_value, d.scale, d.rotation,
          d.split_mode, d.sync_enabled, d.file_hash, d.folder_id, d.missing,
-         d.translation_progress,
+         d.translation_progress, d.active_profile_id, d.reasoning_effort,
          COALESCE((
            SELECT GROUP_CONCAT(tag, char(31))
              FROM document_tags
@@ -140,25 +140,26 @@ export async function listRecentDocuments(): Promise<ReaderDocument[]> {
   return rows.map(rowToDocument);
 }
 
-export async function listLibraryDocuments(): Promise<ReaderDocument[]> {
-  if (!runningInTauri()) return browserDocuments();
-  const db = await getDatabase();
-  const rows = await db.select<DocumentRow[]>(
-    `${DOCUMENT_SELECT} ORDER BY d.title COLLATE NOCASE`,
-  );
-  return rows.map(rowToDocument);
-}
-
-export async function findDocument(
-  id: string,
+export async function findDocumentByIdentity(
+  fileHash: string,
+  legacyId?: string,
 ): Promise<ReaderDocument | null> {
   if (!runningInTauri()) {
-    return browserDocuments().find((document) => document.id === id) ?? null;
+    return (
+      browserDocuments().find((document) => document.fileHash === fileHash) ??
+      (legacyId
+        ? browserDocuments().find((document) => document.id === legacyId)
+        : undefined) ??
+      null
+    );
   }
   const db = await getDatabase();
   const rows = await db.select<DocumentRow[]>(
-    `${DOCUMENT_SELECT} WHERE d.id = $1 LIMIT 1`,
-    [id],
+    `${DOCUMENT_SELECT}
+      WHERE d.file_hash = $1 OR ($2 IS NOT NULL AND d.id = $2)
+      ORDER BY CASE WHEN d.file_hash = $1 THEN 0 ELSE 1 END
+      LIMIT 1`,
+    [fileHash, legacyId ?? null],
   );
   return rows[0] ? rowToDocument(rows[0]) : null;
 }
@@ -166,7 +167,9 @@ export async function findDocument(
 export async function saveDocument(document: ReaderDocument): Promise<void> {
   if (!runningInTauri()) {
     const documents = browserDocuments().filter(
-      (candidate) => candidate.id !== document.id,
+      (candidate) =>
+        candidate.id !== document.id &&
+        candidate.filePath !== document.filePath,
     );
     writeBrowserDocuments([{ ...document, missing: false }, ...documents]);
     return;
@@ -174,13 +177,17 @@ export async function saveDocument(document: ReaderDocument): Promise<void> {
 
   const db = await getDatabase();
   await db.execute(
+    `DELETE FROM documents WHERE file_path = $1 AND id <> $2`,
+    [document.filePath, document.id],
+  );
+  await db.execute(
     `INSERT INTO documents (
        id, file_path, title, page_count, last_opened_at,
        page_number, relative_offset_y, scale_value, scale, rotation,
        split_mode, sync_enabled, updated_at, file_hash, folder_id, missing,
-       translation_progress
+       translation_progress, active_profile_id, reasoning_effort
      ) VALUES (
-       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 0, $16
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 0, $16, $17, $18
      )
      ON CONFLICT(id) DO UPDATE SET
        file_path = excluded.file_path,
@@ -198,7 +205,9 @@ export async function saveDocument(document: ReaderDocument): Promise<void> {
        file_hash = COALESCE(excluded.file_hash, documents.file_hash),
        folder_id = COALESCE(excluded.folder_id, documents.folder_id),
        missing = 0,
-       translation_progress = excluded.translation_progress`,
+       translation_progress = excluded.translation_progress,
+       active_profile_id = excluded.active_profile_id,
+       reasoning_effort = excluded.reasoning_effort`,
     [
       document.id,
       document.filePath,
@@ -216,6 +225,8 @@ export async function saveDocument(document: ReaderDocument): Promise<void> {
       document.fileHash ?? null,
       document.folderId ?? null,
       document.translationProgress ?? 0,
+      document.activeProfileId ?? null,
+      document.reasoningEffort ?? null,
     ],
   );
 }
@@ -264,96 +275,12 @@ export async function updateReadingState(
   );
 }
 
-export async function saveLibraryScan(
-  folder: LibraryFolder,
-  files: ScannedPdfFile[],
-): Promise<void> {
-  await saveLibraryFolder(folder);
-  if (!runningInTauri()) {
-    const byId = new Map(browserDocuments().map((document) => [document.id, document]));
-    for (const document of byId.values()) {
-      if (document.folderId === folder.id) document.missing = true;
-    }
-    for (const file of files) {
-      const id = stableDocumentId(file.path);
-      const previous = byId.get(id);
-      byId.set(id, {
-        id,
-        filePath: file.path,
-        title: previous?.title || file.fileName.replace(/\.pdf$/i, ""),
-        pageCount: previous?.pageCount ?? 0,
-        lastOpenedAt: previous?.lastOpenedAt ?? file.modifiedAt,
-        viewState: previous?.viewState ?? DEFAULT_VIEW_STATE,
-        splitMode: previous?.splitMode ?? "side-by-side",
-        syncEnabled: previous?.syncEnabled ?? true,
-        fileHash: file.fileHash,
-        folderId: folder.id,
-        missing: false,
-        tags: previous?.tags ?? [],
-        translationProgress: previous?.translationProgress ?? 0,
-      });
-    }
-    writeBrowserDocuments([...byId.values()]);
-    return;
-  }
-
-  const db = await getDatabase();
-  await db.execute(`UPDATE documents SET missing = 1 WHERE folder_id = $1`, [
-    folder.id,
-  ]);
-  for (const file of files) {
-    const id = stableDocumentId(file.path);
-    await db.execute(
-      `INSERT INTO documents (
-         id, file_path, title, page_count, last_opened_at, page_number,
-         relative_offset_y, scale_value, scale, rotation, split_mode,
-         sync_enabled, updated_at, file_hash, folder_id, missing,
-         translation_progress
-       ) VALUES (
-         $1, $2, $3, 0, $4, 1, 0, 'page-width', 1, 0, 'side-by-side',
-         1, $4, $5, $6, 0, 0
-       )
-       ON CONFLICT(id) DO UPDATE SET
-         file_path = excluded.file_path,
-         file_hash = excluded.file_hash,
-         folder_id = excluded.folder_id,
-         missing = 0,
-         updated_at = excluded.updated_at`,
-      [id, file.path, file.fileName.replace(/\.pdf$/i, ""), file.modifiedAt, file.fileHash, folder.id],
-    );
-  }
-}
-
-export async function setDocumentTags(
-  documentId: string,
-  tags: string[],
-): Promise<void> {
-  const normalized = [...new Set(tags.map((tag) => tag.trim()).filter(Boolean))];
-  if (!runningInTauri()) {
-    writeBrowserDocuments(
-      browserDocuments().map((document) =>
-        document.id === documentId ? { ...document, tags: normalized } : document,
-      ),
-    );
-    return;
-  }
-  const db = await getDatabase();
-  await db.execute(`DELETE FROM document_tags WHERE document_id = $1`, [
-    documentId,
-  ]);
-  for (const tag of normalized) {
-    await db.execute(
-      `INSERT INTO document_tags (document_id, tag) VALUES ($1, $2)`,
-      [documentId, tag],
-    );
-  }
-}
-
 export function makeReaderDocument(
   id: string,
   filePath: string,
   title: string,
   pageCount: number,
+  fileHash: string,
   previous?: ReaderDocument | null,
 ): ReaderDocument {
   return {
@@ -363,13 +290,15 @@ export function makeReaderDocument(
     pageCount,
     lastOpenedAt: new Date().toISOString(),
     viewState: previous?.viewState ?? DEFAULT_VIEW_STATE,
-    splitMode: previous?.splitMode ?? "side-by-side",
-    syncEnabled: previous?.syncEnabled ?? true,
-    fileHash: previous?.fileHash,
+    splitMode: "side-by-side",
+    syncEnabled: false,
+    fileHash,
     folderId: previous?.folderId,
     missing: false,
     tags: previous?.tags ?? [],
     translationProgress: previous?.translationProgress ?? 0,
+    activeProfileId: previous?.activeProfileId,
+    reasoningEffort: previous?.reasoningEffort,
   };
 }
 
@@ -535,39 +464,6 @@ export async function saveTranslations(
       ],
     );
   }
-}
-
-export async function saveTranslationJob(job: TranslationJob): Promise<void> {
-  if (!runningInTauri()) {
-    const jobs = readBrowserValue<TranslationJob[]>("translation-jobs", []);
-    writeBrowserValue("translation-jobs", [
-      job,
-      ...jobs.filter((candidate) => candidate.id !== job.id),
-    ].slice(0, 100));
-    return;
-  }
-  const db = await getDatabase();
-  await db.execute(
-    `INSERT INTO translation_jobs (
-       id, document_id, status, total_blocks, completed_blocks,
-       failed_block_ids_json, started_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT(id) DO UPDATE SET
-       status = excluded.status,
-       completed_blocks = excluded.completed_blocks,
-       failed_block_ids_json = excluded.failed_block_ids_json,
-       updated_at = excluded.updated_at`,
-    [
-      job.id,
-      job.documentId,
-      job.status,
-      job.totalBlocks,
-      job.completedBlocks,
-      JSON.stringify(job.failedBlockIds),
-      job.startedAt,
-      job.updatedAt,
-    ],
-  );
 }
 
 export async function listHighlights(
@@ -844,6 +740,8 @@ export async function listChatSessions(
         role: ChatMessage["role"];
         content: string;
         source_text: string | null;
+        context_mode: ChatMessage["contextMode"] | null;
+        evidence_json: string | null;
         created_at: string;
       }>
     >(`SELECT * FROM chat_messages WHERE session_id = $1 ORDER BY created_at`, [
@@ -861,6 +759,10 @@ export async function listChatSessions(
         role: message.role,
         content: message.content,
         sourceText: message.source_text ?? undefined,
+        contextMode: message.context_mode ?? undefined,
+        evidence: message.evidence_json
+          ? (JSON.parse(message.evidence_json) as ChatMessage["evidence"])
+          : undefined,
         createdAt: message.created_at,
       })),
     });
@@ -893,57 +795,21 @@ export async function saveChatSession(session: ChatSession): Promise<void> {
   for (const message of session.messages) {
     await db.execute(
       `INSERT OR REPLACE INTO chat_messages (
-         id, session_id, role, content, source_text, created_at
-       ) VALUES ($1, $2, $3, $4, $5, $6)`,
+         id, session_id, role, content, source_text, context_mode,
+         evidence_json, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         message.id,
         session.id,
         message.role,
         message.content,
         message.sourceText ?? null,
+        message.contextMode ?? null,
+        message.evidence ? JSON.stringify(message.evidence) : null,
         message.createdAt,
       ],
     );
   }
-}
-
-export async function listLibraryFolders(): Promise<LibraryFolder[]> {
-  if (!runningInTauri()) {
-    return readBrowserValue<LibraryFolder[]>("library-folders", []);
-  }
-  const db = await getDatabase();
-  const rows = await db.select<
-    Array<{
-      id: string;
-      path: string;
-      name: string;
-      last_scanned_at: string;
-    }>
-  >(`SELECT * FROM library_folders ORDER BY name COLLATE NOCASE`);
-  return rows.map((row) => ({
-    id: row.id,
-    path: row.path,
-    name: row.name,
-    lastScannedAt: row.last_scanned_at,
-  }));
-}
-
-export async function saveLibraryFolder(folder: LibraryFolder): Promise<void> {
-  if (!runningInTauri()) {
-    const folders = readBrowserValue<LibraryFolder[]>("library-folders", []);
-    writeBrowserValue("library-folders", [
-      folder,
-      ...folders.filter((candidate) => candidate.id !== folder.id),
-    ]);
-    return;
-  }
-  const db = await getDatabase();
-  await db.execute(
-    `INSERT OR REPLACE INTO library_folders (
-       id, path, name, last_scanned_at
-     ) VALUES ($1, $2, $3, $4)`,
-    [folder.id, folder.path, folder.name, folder.lastScannedAt],
-  );
 }
 
 export async function loadLlmSettings(): Promise<LlmSettings> {

@@ -1,42 +1,74 @@
-import { ExternalLink, X } from "lucide-react";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
-import { useEffect, useRef, useState } from "react";
-import type { DocumentReference } from "../types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { referencePreviewPosition } from "../lib/reference-preview";
+import type {
+  DocumentReference,
+  ReferenceAnchor,
+} from "../types";
 
 type FigurePreviewProps = {
   document: PDFDocumentProxy;
   reference: DocumentReference;
-  translatedCaption?: string;
-  onClose: () => void;
+  anchor: ReferenceAnchor;
+  caption?: string;
+  onEnter: () => void;
+  onLeave: () => void;
   onGoToPage: (pageNumber: number) => void;
 };
 
 export function FigurePreview({
   document,
   reference,
-  translatedCaption,
-  onClose,
+  anchor,
+  caption,
+  onEnter,
+  onLeave,
   onGoToPage,
 }: FigurePreviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [error, setError] = useState<string | null>(null);
+  const position = useMemo(
+    () =>
+      referencePreviewPosition(anchor, {
+        width: window.innerWidth,
+        height: window.innerHeight,
+      }),
+    [anchor],
+  );
 
   useEffect(() => {
     const canvas = canvasRef.current;
     const pageNumber = reference.targetPageNumber;
-    if (!canvas || !pageNumber) return;
+    const bbox = reference.targetBbox;
+    if (!canvas || !pageNumber || !bbox) return;
     let task: RenderTask | null = null;
     let cancelled = false;
+    setError(null);
     void document
       .getPage(pageNumber)
       .then((page) => {
         if (cancelled) return;
-        const viewport = page.getViewport({ scale: 1.35 });
-        canvas.width = Math.ceil(viewport.width);
-        canvas.height = Math.ceil(viewport.height);
+        const unitViewport = page.getViewport({ scale: 1 });
+        const sourceWidth = Math.max(1, bbox.width * unitViewport.width);
+        const sourceHeight = Math.max(1, bbox.height * unitViewport.height);
+        const scale = Math.min(2.2, 500 / sourceWidth, 330 / sourceHeight);
+        const viewport = page.getViewport({ scale });
+        const cropX = bbox.x * viewport.width;
+        const cropY = bbox.y * viewport.height;
+        const cropWidth = Math.max(1, bbox.width * viewport.width);
+        const cropHeight = Math.max(1, bbox.height * viewport.height);
+        canvas.width = Math.ceil(cropWidth);
+        canvas.height = Math.ceil(cropHeight);
         const context = canvas.getContext("2d");
-        if (!context) throw new Error("Canvas를 준비하지 못했습니다.");
-        task = page.render({ canvas, canvasContext: context, viewport });
+        if (!context) throw new Error("미리보기 캔버스를 준비하지 못했습니다.");
+        context.fillStyle = "#fff";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        task = page.render({
+          canvas,
+          canvasContext: context,
+          viewport,
+          transform: [1, 0, 0, 1, -cropX, -cropY],
+        });
         return task.promise;
       })
       .catch((cause) => {
@@ -48,57 +80,43 @@ export function FigurePreview({
       cancelled = true;
       task?.cancel();
     };
-  }, [document, reference.targetPageNumber]);
+  }, [
+    document,
+    reference.targetBbox,
+    reference.targetPageNumber,
+  ]);
 
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section
-        className="figure-preview"
-        role="dialog"
-        aria-modal="true"
-        aria-label={`${reference.label} 미리보기`}
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <header>
-          <div>
-            <span>{reference.kind === "figure" ? "FIGURE" : "TABLE"}</span>
-            <h2>{reference.label}</h2>
-          </div>
-          <button type="button" onClick={onClose} aria-label="미리보기 닫기">
-            <X size={17} />
-          </button>
-        </header>
-        <div className="figure-canvas-wrap">
-          {error ? <p className="tool-error">{error}</p> : <canvas ref={canvasRef} />}
-          {reference.targetBbox && (
-            <span
-              className="figure-target-box"
-              style={{
-                left: `${reference.targetBbox.x * 100}%`,
-                top: `${reference.targetBbox.y * 100}%`,
-                width: `${reference.targetBbox.width * 100}%`,
-                height: `${reference.targetBbox.height * 100}%`,
-              }}
-            />
-          )}
-        </div>
-        {translatedCaption && (
-          <p className="figure-translated-caption">{translatedCaption}</p>
+    <aside
+      className="reference-preview-card"
+      role="tooltip"
+      aria-label={`${reference.label} 미리보기`}
+      style={position}
+      onMouseEnter={onEnter}
+      onMouseLeave={onLeave}
+    >
+      <div className="reference-preview-media">
+        {error ? (
+          <p className="tool-error">{error}</p>
+        ) : (
+          <canvas ref={canvasRef} />
         )}
-        <footer>
-          <span>p. {reference.targetPageNumber ?? "?"}</span>
-          {reference.targetPageNumber && (
-            <button
-              type="button"
-              className="secondary-action"
-              onClick={() => onGoToPage(reference.targetPageNumber!)}
-            >
-              <ExternalLink size={15} />
-              원본 페이지로 이동
-            </button>
-          )}
-        </footer>
-      </section>
-    </div>
+      </div>
+      {caption && (
+        <p className="reference-preview-caption">
+          {caption}
+        </p>
+      )}
+      <button
+        type="button"
+        className="reference-preview-page"
+        onClick={() =>
+          reference.targetPageNumber &&
+          onGoToPage(reference.targetPageNumber)
+        }
+      >
+        {reference.label} · 원문 p. {reference.targetPageNumber ?? "?"}
+      </button>
+    </aside>
   );
 }

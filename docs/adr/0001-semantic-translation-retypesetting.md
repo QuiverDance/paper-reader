@@ -1,6 +1,6 @@
 # ADR 0001: Reconstruct translated papers from a semantic document model
 
-- Status: Accepted
+- Status: Superseded in part by ADR 0002 and ADR 0004
 - Date: 2026-07-27
 
 ## Context
@@ -17,8 +17,9 @@ harder to verify. The source paper must remain authoritative and unchanged.
 
 ## Decision
 
-Paperloom will keep the existing in-page overlay as a fast reading aid and add a
-separate translation re-typeset workflow.
+Paperloom originally kept the in-page overlay as a fast reading aid and added a
+separate translation re-typeset workflow. ADR 0002 later removed the overlay and
+made the saved bilingual re-typeset the sole translation experience.
 
 The new workflow will:
 
@@ -33,8 +34,8 @@ The new workflow will:
    figure/table regions as vector-preserving PDF fragments when reliable.
 6. Reflow into a separate PDF with the source page size and column count, but
    permit different line breaks, pagination, and asset coordinates.
-7. Require side-by-side review. Content-integrity failures block export; visual
-   warnings may be acknowledged.
+7. Run automatic integrity validation before application. Content-integrity
+   failures block replacement and export; visual warnings may be surfaced later.
 8. Run structure analysis and PDF creation locally. Only translatable prose is
    sent to the selected model connection.
 9. Guarantee the first high-quality path for digital English-to-Korean papers,
@@ -49,7 +50,7 @@ credentials.
 - The translated PDF is a derivative document rather than a modified source.
 - Page numbers and coordinates are not stable across source and translation.
 - Paperloom needs a resumable project record, semantic validation, font assets,
-  a PDF composition module, and a review experience.
+  a PDF composition module, and an inline correction experience.
 - Figure/table hover previews remain an app feature. Exported PDFs use links.
 - High-fidelity reconstruction can fail on unusual PDFs; those failures must be
   visible instead of silently dropping content.

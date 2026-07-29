@@ -7,6 +7,7 @@ import {
   normalizeAnchor,
   normalizeRotation,
   scaleBy,
+  shouldApplyScrollAnchor,
 } from "../src/lib/reader-state";
 
 describe("reader state", () => {
@@ -39,5 +40,16 @@ describe("reader state", () => {
       rotation: 90,
     });
   });
-});
 
+  it("does not reapply a scroll anchor that the same pane just reported", () => {
+    const anchor = { pageNumber: 4, relativeOffsetY: 0.37 };
+
+    expect(shouldApplyScrollAnchor(anchor, anchor)).toBe(false);
+    expect(
+      shouldApplyScrollAnchor(
+        { pageNumber: 5, relativeOffsetY: 0 },
+        anchor,
+      ),
+    ).toBe(true);
+  });
+});

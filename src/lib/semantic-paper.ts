@@ -9,6 +9,8 @@ import type {
   SemanticPaper,
   TranslationRecord,
 } from "../types";
+import { inferContentStartPage } from "./document-blocks";
+import { translationParagraphsForPaper } from "./translation-paragraphs";
 
 const REFERENCES_HEADING = /^(references|bibliography)$/i;
 const ABSTRACT_HEADING = /^abstract$/i;
@@ -60,6 +62,58 @@ export function isEquationLike(text: string): boolean {
   return math >= 1 && letters / normalized.length < 0.42;
 }
 
+export function isCodeLike(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  return (
+    /(?:=>|===?|!==?|<=|>=|\+\+|--|&&|\|\||::|[{};])/u.test(
+      normalized,
+    ) ||
+    /\b(?:class|def|function|import|from|return|const|let|var|for|while|if|else|try|catch)\b[^{.;]*(?:[({:=])/iu.test(
+      normalized,
+    ) ||
+    /(?:\w+\.)+\w+\s*\(|\w+\s*\([^)]*\)\s*(?:\{|:|=>)/u.test(
+      normalized,
+    )
+  );
+}
+
+export function looksLikeNaturalProse(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized || isCodeLike(normalized) || isEquationLike(normalized)) {
+    return false;
+  }
+  const words = normalized.match(/[A-Za-z][A-Za-z'-]*/g) ?? [];
+  const letters = (normalized.match(/[A-Za-z]/g) ?? []).length;
+  const sentenceLike =
+    /^[a-z]/.test(normalized) || /[.!?]["')\]]*$/.test(normalized);
+  const collapsedPdfProse =
+    words.length <= 2 &&
+    letters >= 24 &&
+    letters / Math.max(1, normalized.length) >= 0.8 &&
+    /^[a-z]/.test(normalized) &&
+    /[,;:]/.test(normalized);
+  return (
+    ((words.length >= 5 && sentenceLike) || collapsedPdfProse) &&
+    letters / Math.max(1, normalized.length) >= 0.65 &&
+    sentenceLike
+  );
+}
+
+export function containsEmbeddedNaturalProse(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized || isCodeLike(normalized) || isEquationLike(normalized)) {
+    return false;
+  }
+  const letters = (normalized.match(/[A-Za-z]/g) ?? []).length;
+  return (
+    letters / Math.max(1, normalized.length) >= 0.65 &&
+    /\b(?:and|but|when|while|because|although|however|the|this|these|those)\s+(?:[a-z][a-z'-]*[\s,]+){3,}[a-z][a-z'-]*/.test(
+      normalized,
+    )
+  );
+}
+
 function isExplanatoryFootnote(block: DocumentBlock): boolean {
   if (block.type !== "footnote") return false;
   if (block.pageNumber === 1 && FRONT_MATTER_NOTE.test(block.text)) return false;
@@ -70,6 +124,12 @@ function isTranslatableSemanticBlock(
   block: DocumentBlock,
   inReferences: boolean,
 ): boolean {
+  if (
+    (block.type === "equation" || block.type === "code-listing") &&
+    looksLikeNaturalProse(block.text)
+  ) {
+    return true;
+  }
   if (inReferences) return false;
   if (
     block.type === "title" ||
@@ -77,6 +137,8 @@ function isTranslatableSemanticBlock(
     block.type === "heading" ||
     block.type === "equation" ||
     block.type === "reference-entry" ||
+    block.type === "running-header" ||
+    block.type === "running-footer" ||
     block.type === "unknown"
   ) {
     return false;
@@ -124,6 +186,34 @@ function sameColumn(left: DocumentBlock, right: DocumentBlock): boolean {
   return end - start >= Math.min(left.bbox.width, right.bbox.width) * 0.35;
 }
 
+function looksLikeBodyProse(block: DocumentBlock): boolean {
+  if (block.type !== "paragraph" && block.type !== "abstract") return false;
+  const text = block.text.trim();
+  if (text.length < 90 || block.bbox.width < 0.25 || block.bbox.height < 0.025) {
+    return false;
+  }
+  const letters = (text.match(/[A-Za-z가-힣]/g) ?? []).length;
+  return letters / Math.max(1, text.length) >= 0.45;
+}
+
+function looksLikeTabularContent(block: DocumentBlock): boolean {
+  const text = block.text.trim();
+  const numericTokens =
+    text.match(
+      /(?:^|\s)[#]?(?:\d+(?:[.,]\d+)?|[-–—])(?=\s|$)/g,
+    ) ?? [];
+  const tableVocabulary =
+    /\b(?:avg|average|dataset|model|queries|contexts|input|output|latency|throughput|rate|size)\b/i.test(
+      text,
+    );
+  return (
+    block.bbox.height <= 0.13 &&
+    block.bbox.width >= 0.16 &&
+    numericTokens.length >= 3 &&
+    (tableVocabulary || numericTokens.length >= 6)
+  );
+}
+
 export function inferAssetRect(
   blocks: DocumentBlock[],
   caption: DocumentBlock,
@@ -138,7 +228,16 @@ export function inferAssetRect(
   const captionBottom = caption.bbox.y + caption.bbox.height;
   const columnCount = estimateColumnCount(blocks);
   const captionCenter = caption.bbox.x + caption.bbox.width / 2;
-  const fullWidthAsset = columnCount === 1 || caption.bbox.width >= 0.58;
+  const captionRight = caption.bbox.x + caption.bbox.width;
+  const captionBridgesColumns =
+    caption.bbox.width >= 0.4 &&
+    caption.bbox.x > 0.18 &&
+    captionRight < 0.82 &&
+    Math.abs(captionCenter - 0.5) < 0.08;
+  const fullWidthAsset =
+    columnCount === 1 ||
+    caption.bbox.width >= 0.58 ||
+    captionBridgesColumns;
   // PDF text extraction cannot see vector/raster graphics. Use the source
   // column bounds horizontally, then infer the vertical gap around the caption.
   // This favors a little whitespace over clipping the actual figure or table.
@@ -146,6 +245,33 @@ export function inferAssetRect(
   const width = fullWidthAsset ? 0.91 : 0.44;
 
   if (caption.type === "table-caption") {
+    const tableAbove = pageBlocks.filter(
+      (block) =>
+        block.bbox.y + block.bbox.height <= captionTop + 0.003 &&
+        block.bbox.y >= Math.max(0.035, captionTop - 0.28) &&
+        sameColumn(block, caption) &&
+        block.type !== "heading" &&
+        block.type !== "footnote" &&
+        block.type !== "figure-caption" &&
+        block.type !== "table-caption" &&
+        (!looksLikeBodyProse(block) || looksLikeTabularContent(block)) &&
+        block.text.trim().length > 1,
+    );
+    if (
+      tableAbove.length >= 2 ||
+      tableAbove.some(looksLikeTabularContent)
+    ) {
+      const top = Math.max(
+        0.035,
+        Math.min(...tableAbove.map((block) => block.bbox.y)) - 0.008,
+      );
+      return {
+        x,
+        y: clamp(top),
+        width: Math.min(width, 1 - x),
+        height: clamp(captionTop - top - 0.006),
+      };
+    }
     const nextTop = pageBlocks
       .filter(
         (block) =>
@@ -192,22 +318,29 @@ export function inferAssetRect(
         Math.max(nearest, block.bbox.y + block.bbox.height),
       0,
     );
-  const previousBottom =
-    referenceBoundary ||
-    precedingBlocks
-      .filter(
-        (block) =>
-          block.type === "heading" ||
-          block.type === "abstract" ||
-          (block.type === "paragraph" &&
-            block.text.length >= 24 &&
-            !/^[A-Z0-9\s+\-_=().]+$/.test(block.text)),
-      )
-      .reduce(
-        (nearest, block) =>
-          Math.max(nearest, block.bbox.y + block.bbox.height),
-        Math.max(0.035, captionTop - 0.36),
-      );
+  const previousBottom = precedingBlocks
+    .filter(
+      (block) =>
+        block.type === "figure-caption" ||
+        block.type === "table-caption" ||
+        (block.type === "heading" &&
+          /^(?:\d+(?:\.\d+)*\.?\s+|references|bibliography|abstract\b)/i.test(
+            block.text.trim(),
+          ) &&
+          (block.fontSize ?? 0) >= (caption.fontSize ?? 8) * 1.1 &&
+          block.bbox.height >= 0.012) ||
+        block.type === "abstract" ||
+        looksLikeBodyProse(block),
+    )
+    .reduce(
+      (nearest, block) =>
+        Math.max(nearest, block.bbox.y + block.bbox.height),
+      Math.max(
+        referenceBoundary,
+        0.035,
+        captionTop - (fullWidthAsset ? 0.48 : 0.36),
+      ),
+    );
   const y = clamp(Math.min(captionTop - 0.07, previousBottom + 0.008));
   return {
     x,
@@ -215,6 +348,51 @@ export function inferAssetRect(
     width: Math.min(width, 1 - x),
     height: clamp(captionTop - y - 0.006),
   };
+}
+
+function inferPaperAssets(blocks: DocumentBlock[]): PaperAsset[] {
+  return blocks.flatMap((block) => {
+    if (
+      block.type !== "figure-caption" &&
+      block.type !== "table-caption"
+    ) {
+      return [];
+    }
+    const kind = block.type === "table-caption" ? "table" : "figure";
+    const bbox = inferAssetRect(blocks, block);
+    const contentBlockIds = blocks
+      .filter((candidate) => {
+        if (
+          candidate.id === block.id ||
+          candidate.pageNumber !== block.pageNumber
+        ) {
+          return false;
+        }
+        const centerX = candidate.bbox.x + candidate.bbox.width / 2;
+        const centerY = candidate.bbox.y + candidate.bbox.height / 2;
+        const horizontalTolerance = 0.025;
+        const verticalTolerance = 0.012;
+        return (
+          centerX >= bbox.x - horizontalTolerance &&
+          centerX <= bbox.x + bbox.width + horizontalTolerance &&
+          centerY >= bbox.y - verticalTolerance &&
+          centerY <= bbox.y + bbox.height + verticalTolerance
+        );
+      })
+      .map((candidate) => candidate.id);
+    return [
+      {
+        id: `${kind}-${assetNumber(block)}-${block.id}`,
+        kind,
+        number: assetNumber(block),
+        captionBlockId: block.id,
+        pageNumber: block.pageNumber,
+        bbox,
+        sectionId: "front-matter",
+        contentBlockIds,
+      },
+    ];
+  });
 }
 
 function createSection(
@@ -242,6 +420,17 @@ export function analyzeSemanticPaper(
   references: DocumentReference[] = [],
 ): SemanticPaper {
   const ordered = sortBlocks(blocks);
+  const contentStartPage = inferContentStartPage(ordered);
+  const paperBlocks = ordered.filter(
+    (block) =>
+      block.pageNumber >= contentStartPage &&
+      block.type !== "running-header" &&
+      block.type !== "running-footer",
+  );
+  const preliminaryAssets = inferPaperAssets(paperBlocks);
+  const assetContentIds = new Set(
+    preliminaryAssets.flatMap((asset) => asset.contentBlockIds),
+  );
   const sections: PaperSection[] = [
     createSection("front-matter", "Front matter", 0),
   ];
@@ -255,10 +444,23 @@ export function analyzeSemanticPaper(
   let referenceHeadingBlockId: string | undefined;
 
   for (const block of ordered) {
+    if (
+      block.pageNumber < contentStartPage ||
+      block.type === "running-header" ||
+      block.type === "running-footer"
+    ) {
+      sections[0].blockIds.push(block.id);
+      blockSectionIds[block.id] = "front-matter";
+      preservedBlockIds.push(block.id);
+      continue;
+    }
     const normalized = block.text.trim();
     const abstractLabelOnly =
       block.type === "abstract" && ABSTRACT_HEADING.test(normalized);
-    if (block.type === "heading" || abstractLabelOnly) {
+    if (
+      !assetContentIds.has(block.id) &&
+      (block.type === "heading" || abstractLabelOnly)
+    ) {
       const level = abstractLabelOnly ? 1 : headingLevel(normalized);
       while (stack.length && stack.at(-1)!.level >= level) stack.pop();
       const parent = stack.at(-1);
@@ -288,54 +490,19 @@ export function analyzeSemanticPaper(
 
     current.blockIds.push(block.id);
     blockSectionIds[block.id] = current.id;
-    const equation = block.type === "equation" || isEquationLike(block.text);
+    const equation = isEquationLike(block.text);
     const translatable =
-      !equation && isTranslatableSemanticBlock(block, inReferences);
+      !assetContentIds.has(block.id) &&
+      !equation &&
+      isTranslatableSemanticBlock(block, inReferences);
     if (translatable) translatableBlockIds.push(block.id);
     else preservedBlockIds.push(block.id);
   }
 
-  const assets: PaperAsset[] = ordered.flatMap((block) => {
-    if (
-      block.type !== "figure-caption" &&
-      block.type !== "table-caption"
-    ) {
-      return [];
-    }
-    const kind = block.type === "table-caption" ? "table" : "figure";
-    const bbox = inferAssetRect(ordered, block);
-    const contentBlockIds = ordered
-      .filter((candidate) => {
-        if (candidate.id === block.id || candidate.pageNumber !== block.pageNumber) {
-          return false;
-        }
-        const centerX = candidate.bbox.x + candidate.bbox.width / 2;
-        const centerY = candidate.bbox.y + candidate.bbox.height / 2;
-        return (
-          centerX >= bbox.x &&
-          centerX <= bbox.x + bbox.width &&
-          centerY >= bbox.y &&
-          centerY <= bbox.y + bbox.height
-        );
-      })
-      .map((candidate) => candidate.id);
-    return [
-      {
-        id: `${kind}-${assetNumber(block)}-${block.id}`,
-        kind,
-        number: assetNumber(block),
-        captionBlockId: block.id,
-        pageNumber: block.pageNumber,
-        bbox,
-        sectionId: blockSectionIds[block.id] ?? "front-matter",
-        contentBlockIds,
-      },
-    ];
-  });
-
-  const assetContentIds = new Set(
-    assets.flatMap((asset) => asset.contentBlockIds),
-  );
+  const assets = preliminaryAssets.map((asset) => ({
+    ...asset,
+    sectionId: blockSectionIds[asset.captionBlockId] ?? "front-matter",
+  }));
   const filteredTranslatableBlockIds = translatableBlockIds.filter(
     (id) => !assetContentIds.has(id),
   );
@@ -348,12 +515,13 @@ export function analyzeSemanticPaper(
 
   return {
     documentId: ordered[0]?.documentId ?? "",
+    contentStartPage,
     sections,
     assets,
     blockSectionIds,
     translatableBlockIds: filteredTranslatableBlockIds,
     preservedBlockIds,
-    columnCount: estimateColumnCount(ordered),
+    columnCount: estimateColumnCount(paperBlocks),
     bodyFontStyle: "serif",
     referenceHeadingBlockId,
   };
@@ -378,6 +546,14 @@ export function createRetypesetProject(
     createdAt: previous?.createdAt ?? now,
     updatedAt: now,
     lastExportedAt: previous?.lastExportedAt,
+    acceptedAt: previous?.acceptedAt,
+    acceptedProfileId: previous?.acceptedProfileId,
+    acceptedEffort: previous?.acceptedEffort,
+    questionDigest: previous?.questionDigest,
+    questionDigestSignature: previous?.questionDigestSignature,
+    nativePdfFileIds: previous?.nativePdfFileIds ?? {},
+    documentStructure: previous?.documentStructure,
+    tokenUsage: previous?.tokenUsage,
   };
 }
 
@@ -411,13 +587,28 @@ export function validateRetypesetProject(
     });
   }
 
-  for (const blockId of paper.translatableBlockIds) {
-    if (!translated.has(blockId) && !fallbacks.has(blockId)) {
+  const translationParagraphs = translationParagraphsForPaper(
+    blocks,
+    paper.translatableBlockIds,
+    new Set(
+      translations
+        .filter(
+          (item) =>
+            item.targetLanguage === project.targetLanguage && item.locked,
+        )
+        .map((item) => item.blockId),
+    ),
+  );
+  for (const paragraph of translationParagraphs) {
+    if (
+      !translated.has(paragraph.id) &&
+      !paragraph.blockIds.some((blockId) => fallbacks.has(blockId))
+    ) {
       warnings.push({
-        id: `missing-translation:${blockId}`,
+        id: `missing-translation:${paragraph.id}`,
         severity: "integrity",
         kind: "missing-translation",
-        blockId,
+        blockId: paragraph.id,
         message: "번역되지 않은 본문 또는 캡션이 있습니다.",
       });
     }
@@ -437,7 +628,7 @@ export function validateRetypesetProject(
 
   for (const block of blocks) {
     if (
-      (block.type === "equation" || isEquationLike(block.text)) &&
+      isEquationLike(block.text) &&
       !validRect(block.bbox)
     ) {
       warnings.push({

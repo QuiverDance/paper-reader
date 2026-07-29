@@ -7,24 +7,34 @@ import {
   PDFLinkService,
   PDFViewer,
 } from "pdfjs-dist/web/pdf_viewer.mjs";
-import { LoaderCircle, ScanSearch } from "lucide-react";
-import { TranslatedTextBlock } from "./TranslatedTextBlock";
+import {
+  ChevronLeft,
+  ChevronRight,
+  LoaderCircle,
+  Maximize2,
+  Minimize2,
+  Minus,
+  Plus,
+  RotateCw,
+} from "lucide-react";
 import type {
+  AnnotationSource,
   DocumentBlock,
   DocumentReference,
   Highlight,
   NormalizedRect,
   PaneId,
+  ReferenceAnchor,
   TextSelection,
-  TranslationRecord,
   ViewState,
 } from "../types";
-import { clamp } from "../lib/reader-state";
 import {
-  availableTranslationHeight,
-  availableTranslationWidth,
-  translationMaskRect,
-} from "../lib/translation-layout";
+  clamp,
+  normalizeRotation,
+  scaleBy,
+  shouldApplyScrollAnchor,
+} from "../lib/reader-state";
+import { mergeReferenceRects } from "../lib/reference-preview";
 
 type PdfPaneProps = {
   document: PDFDocumentProxy;
@@ -34,19 +44,22 @@ type PdfPaneProps = {
   targetState: ViewState;
   active: boolean;
   blocks: DocumentBlock[];
-  translations: TranslationRecord[];
   highlights: Highlight[];
   references: DocumentReference[];
-  translationOverlay: boolean;
+  expanded: boolean;
   onActivate: (paneId: PaneId) => void;
   onUpdate: (paneId: PaneId, update: Partial<ViewState>) => void;
+  onToggleExpand: (paneId: PaneId) => void;
   onSelection: (selection: TextSelection) => void;
   onWordLookup: (selection: TextSelection) => void;
-  onReference: (reference: DocumentReference) => void;
-  onEditTranslation: (translation: TranslationRecord, text: string) => void;
+  onReferenceEnter: (
+    reference: DocumentReference,
+    anchor: ReferenceAnchor,
+    surface: AnnotationSource,
+  ) => void;
+  onReferenceLeave: () => void;
 };
 
-type PageChangingEvent = { pageNumber: number };
 type ScaleChangingEvent = {
   scale: number;
   presetValue?: string | null;
@@ -95,6 +108,94 @@ function rectStyle(rect: NormalizedRect, rotation: number) {
   };
 }
 
+function textLayerReferenceRects(
+  pageElement: HTMLElement,
+  label: string,
+  sourceBlockRect: NormalizedRect,
+  rotation: number,
+): NormalizedRect[] {
+  const textLayer = pageElement.querySelector<HTMLElement>(".textLayer");
+  if (!textLayer) return [];
+  const textNodes: Array<{ node: Text; start: number; end: number }> = [];
+  let source = "";
+  const walker = window.document.createTreeWalker(
+    textLayer,
+    NodeFilter.SHOW_TEXT,
+  );
+  let current = walker.nextNode();
+  while (current) {
+    const node = current as Text;
+    textNodes.push({
+      node,
+      start: source.length,
+      end: source.length + node.data.length,
+    });
+    source += node.data;
+    current = walker.nextNode();
+  }
+  if (!source) return [];
+
+  const escapedParts = label
+    .trim()
+    .split(/\s+/)
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const pattern = new RegExp(escapedParts.join("\\s*"), "gi");
+  const pageRect = pageElement.getBoundingClientRect();
+  const expected = rotateRect(sourceBlockRect, rotation);
+  const expectedCenter = {
+    x: expected.x + expected.width / 2,
+    y: expected.y + expected.height / 2,
+  };
+  const candidates: Array<{
+    rects: NormalizedRect[];
+    distance: number;
+  }> = [];
+
+  for (const match of source.matchAll(pattern)) {
+    const start = match.index;
+    const end = start + match[0].length;
+    const startNode = textNodes.find(
+      (entry) => start >= entry.start && start < entry.end,
+    );
+    const endNode = textNodes.find(
+      (entry) => end > entry.start && end <= entry.end,
+    );
+    if (!startNode || !endNode) continue;
+    const range = window.document.createRange();
+    range.setStart(startNode.node, start - startNode.start);
+    range.setEnd(endNode.node, end - endNode.start);
+    const rects = Array.from(range.getClientRects())
+      .filter((rect) => rect.width > 0 && rect.height > 0)
+      .map((rect) => ({
+        x: clamp((rect.left - pageRect.left) / pageRect.width, 0, 1),
+        y: clamp((rect.top - pageRect.top) / pageRect.height, 0, 1),
+        width: clamp(rect.width / pageRect.width, 0, 1),
+        height: clamp(rect.height / pageRect.height, 0, 1),
+      }));
+    if (!rects.length) continue;
+    const center = {
+      x:
+        rects.reduce(
+          (sum, rect) => sum + rect.x + rect.width / 2,
+          0,
+        ) / rects.length,
+      y:
+        rects.reduce(
+          (sum, rect) => sum + rect.y + rect.height / 2,
+          0,
+        ) / rects.length,
+    };
+    candidates.push({
+      rects,
+      distance:
+        (center.x - expectedCenter.x) ** 2 +
+        (center.y - expectedCenter.y) ** 2,
+    });
+  }
+  candidates.sort((left, right) => left.distance - right.distance);
+  return mergeReferenceRects(candidates[0]?.rects ?? []);
+}
+
 export function PdfPane({
   document,
   paneId,
@@ -103,16 +204,16 @@ export function PdfPane({
   targetState,
   active,
   blocks,
-  translations,
   highlights,
   references,
-  translationOverlay,
+  expanded,
   onActivate,
   onUpdate,
+  onToggleExpand,
   onSelection,
   onWordLookup,
-  onReference,
-  onEditTranslation,
+  onReferenceEnter,
+  onReferenceLeave,
 }: PdfPaneProps) {
   const sectionRef = useRef<HTMLElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -122,6 +223,7 @@ export function PdfPane({
   const applyingRef = useRef(false);
   const releaseTimerRef = useRef<number | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
+  const locallyReportedAnchorRef = useRef<ViewState | null>(null);
   const pageRevisionRef = useRef(0);
   const latestStateRef = useRef(targetState);
   const [ready, setReady] = useState(false);
@@ -271,12 +373,6 @@ export function PdfPane({
       });
     };
 
-    const onPageChanging = (event: PageChangingEvent) => {
-      if (!applyingRef.current) {
-        onUpdate(paneId, { pageNumber: event.pageNumber });
-      }
-    };
-
     const onScaleChanging = (event: ScaleChangingEvent) => {
       if (!applyingRef.current) {
         onUpdate(paneId, {
@@ -310,6 +406,11 @@ export function PdfPane({
         0,
         1,
       );
+      locallyReportedAnchorRef.current = {
+        ...latestStateRef.current,
+        pageNumber,
+        relativeOffsetY,
+      };
       onUpdate(paneId, { pageNumber, relativeOffsetY });
     };
 
@@ -320,10 +421,10 @@ export function PdfPane({
     };
 
     eventBus.on("pagesinit", onPagesInit);
-    eventBus.on("pagechanging", onPageChanging);
     eventBus.on("scalechanging", onScaleChanging);
     eventBus.on("rotationchanging", onRotationChanging);
     eventBus.on("pagerendered", onPageRendered);
+    eventBus.on("textlayerrendered", onPageRendered);
     container.addEventListener("scroll", onScroll, { passive: true });
 
     return () => {
@@ -332,10 +433,10 @@ export function PdfPane({
       setPageElements([]);
       container.removeEventListener("scroll", onScroll);
       eventBus.off("pagesinit", onPagesInit);
-      eventBus.off("pagechanging", onPageChanging);
       eventBus.off("scalechanging", onScaleChanging);
       eventBus.off("rotationchanging", onRotationChanging);
       eventBus.off("pagerendered", onPageRendered);
+      eventBus.off("textlayerrendered", onPageRendered);
       if (scrollFrameRef.current !== null) {
         window.cancelAnimationFrame(scrollFrameRef.current);
       }
@@ -354,19 +455,33 @@ export function PdfPane({
     const viewer = pdfViewerRef.current;
     if (!viewer || !readyRef.current) return;
 
+    const applyScrollAnchor = shouldApplyScrollAnchor(
+      targetState,
+      locallyReportedAnchorRef.current,
+    );
+    if (!applyScrollAnchor) {
+      locallyReportedAnchorRef.current = null;
+    }
+    const rotationChanged = viewer.pagesRotation !== targetState.rotation;
+    const scaleChanged = viewer.currentScaleValue !== targetState.scaleValue;
+    if (!applyScrollAnchor && !rotationChanged && !scaleChanged) return;
+
     applyingRef.current = true;
-    if (viewer.pagesRotation !== targetState.rotation) {
+    if (rotationChanged) {
       viewer.pagesRotation = targetState.rotation;
     }
-    if (viewer.currentScaleValue !== targetState.scaleValue) {
+    if (scaleChanged) {
       viewer.currentScaleValue = targetState.scaleValue;
     }
-    if (viewer.currentPageNumber !== targetState.pageNumber) {
+    if (
+      applyScrollAnchor &&
+      viewer.currentPageNumber !== targetState.pageNumber
+    ) {
       viewer.currentPageNumber = targetState.pageNumber;
     }
     window.requestAnimationFrame(() => {
       collectPageElements();
-      applyAnchor(targetState);
+      if (applyScrollAnchor) applyAnchor(targetState);
       releaseApplying();
     });
   }, [
@@ -401,9 +516,92 @@ export function PdfPane({
           <strong>{label}</strong>
           <span>{detail}</span>
         </div>
-        <span className="pane-page">
-          {targetState.pageNumber} / {document.numPages}
-        </span>
+        <div className="pane-controls">
+          <button
+            type="button"
+            disabled={targetState.pageNumber <= 1}
+            title="이전 페이지"
+            onClick={() =>
+              onUpdate(paneId, {
+                pageNumber: targetState.pageNumber - 1,
+                relativeOffsetY: 0,
+              })
+            }
+          >
+            <ChevronLeft size={14} />
+          </button>
+          <span className="pane-page">
+            {targetState.pageNumber} / {document.numPages}
+          </span>
+          <button
+            type="button"
+            disabled={targetState.pageNumber >= document.numPages}
+            title="다음 페이지"
+            onClick={() =>
+              onUpdate(paneId, {
+                pageNumber: targetState.pageNumber + 1,
+                relativeOffsetY: 0,
+              })
+            }
+          >
+            <ChevronRight size={14} />
+          </button>
+          <button
+            type="button"
+            title="축소"
+            onClick={() => {
+              const scale = scaleBy(targetState.scale, "out");
+              onUpdate(paneId, { scale, scaleValue: String(scale) });
+            }}
+          >
+            <Minus size={13} />
+          </button>
+          <span className="pane-zoom">
+            {Math.round(targetState.scale * 100)}%
+          </span>
+          <button
+            type="button"
+            title="확대"
+            onClick={() => {
+              const scale = scaleBy(targetState.scale, "in");
+              onUpdate(paneId, { scale, scaleValue: String(scale) });
+            }}
+          >
+            <Plus size={13} />
+          </button>
+          <button
+            type="button"
+            title="너비 맞춤"
+            onClick={() => onUpdate(paneId, { scaleValue: "page-width" })}
+          >
+            너비
+          </button>
+          <button
+            type="button"
+            title="페이지 맞춤"
+            onClick={() => onUpdate(paneId, { scaleValue: "page-fit" })}
+          >
+            맞춤
+          </button>
+          <button
+            type="button"
+            title="회전"
+            onClick={() =>
+              onUpdate(paneId, {
+                rotation: normalizeRotation(targetState.rotation + 90),
+              })
+            }
+          >
+            <RotateCw size={13} />
+          </button>
+          <button
+            type="button"
+            title={expanded ? "두 논문 보기" : `${label} 크게 보기`}
+            onClick={() => onToggleExpand(paneId)}
+          >
+            {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          </button>
+        </div>
       </header>
       <div className="pdf-scroll" ref={containerRef}>
         <div className="pdfViewer" ref={viewerElementRef} />
@@ -438,77 +636,65 @@ export function PdfPane({
                 )),
               )}
 
-            {translationOverlay &&
-              paneId === "companion" &&
-              blocks
-                .filter((block) => block.pageNumber === pageNumber)
-                .map((block) => {
-                  const translation = translations.find(
-                    (candidate) =>
-                      candidate.blockId === block.id &&
-                      candidate.status === "translated",
-                  );
-                  if (!translation) return null;
-                  const maskRect = translationMaskRect(block);
-                  const expandedRect = {
-                    ...maskRect,
-                    width: availableTranslationWidth(
-                      block,
-                      blocks.filter(
-                        (candidate) => candidate.pageNumber === pageNumber,
-                      ),
-                    ),
-                    height: availableTranslationHeight(
-                      block,
-                      blocks.filter(
-                        (candidate) => candidate.pageNumber === pageNumber,
-                      ),
-                    ),
-                  };
-                  return (
-                    <TranslatedTextBlock
-                      key={translation.id}
-                      block={block}
-                      translation={translation}
-                      style={rectStyle(maskRect, targetState.rotation)}
-                      expandedStyle={rectStyle(
-                        expandedRect,
-                        targetState.rotation,
-                      )}
-                      scale={targetState.scale}
-                      onEdit={onEditTranslation}
-                    />
-                  );
-                })}
-
-            {paneId === "original" &&
-              references
+            {references
                 .filter(
                   (reference) => reference.sourcePageNumber === pageNumber,
                 )
-                .map((reference) => {
+                .flatMap((reference) => {
                   const sourceBlock = blocks.find(
                     (block) => block.id === reference.sourceBlockId,
                   );
-                  if (!sourceBlock) return null;
-                  return (
+                  const pageElement = host.closest<HTMLElement>(".page");
+                  if (!sourceBlock || !pageElement) return [];
+                  return textLayerReferenceRects(
+                    pageElement,
+                    reference.label,
+                    sourceBlock.bbox,
+                    targetState.rotation,
+                  ).map((rect, index) => (
                     <button
                       type="button"
                       className="reference-hotspot"
-                      key={reference.id}
-                      style={rectStyle(sourceBlock.bbox, targetState.rotation)}
+                      key={`${reference.id}-${index}`}
+                      style={rectStyle(rect, 0)}
                       disabled={!reference.targetPageNumber}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onReference(reference);
+                      onMouseEnter={(event) => {
+                        const anchor =
+                          event.currentTarget.getBoundingClientRect();
+                        onReferenceEnter(
+                          reference,
+                          {
+                            left: anchor.left,
+                            top: anchor.top,
+                            right: anchor.right,
+                            bottom: anchor.bottom,
+                            width: anchor.width,
+                            height: anchor.height,
+                          },
+                          paneId === "original" ? "original" : "translation",
+                        );
                       }}
-                      onMouseEnter={() => onReference(reference)}
-                      title={`${reference.label} 미리보기`}
-                    >
-                      <ScanSearch size={12} />
-                      {reference.label}
-                    </button>
-                  );
+                      onMouseLeave={onReferenceLeave}
+                      onFocus={(event) => {
+                        const anchor =
+                          event.currentTarget.getBoundingClientRect();
+                        onReferenceEnter(
+                          reference,
+                          {
+                            left: anchor.left,
+                            top: anchor.top,
+                            right: anchor.right,
+                            bottom: anchor.bottom,
+                            width: anchor.width,
+                            height: anchor.height,
+                          },
+                          paneId === "original" ? "original" : "translation",
+                        );
+                      }}
+                      onBlur={onReferenceLeave}
+                      aria-label={`${reference.label} 미리보기`}
+                    />
+                  ));
                 })}
           </div>,
           host,
