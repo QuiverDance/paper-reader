@@ -71,3 +71,13 @@ export function viewStateIsClose(
   );
 }
 
+export function shouldApplyScrollAnchor(
+  target: ScrollAnchor,
+  locallyReported: ScrollAnchor | null,
+): boolean {
+  return (
+    !locallyReported ||
+    target.pageNumber !== locallyReported.pageNumber ||
+    Math.abs(target.relativeOffsetY - locallyReported.relativeOffsetY) >= 0.002
+  );
+}

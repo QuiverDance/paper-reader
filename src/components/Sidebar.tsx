@@ -1,23 +1,23 @@
 import {
   BookOpenText,
+  CheckCircle2,
   Clock3,
   FileText,
-  FolderClosed,
   Library,
   Search,
-  Tag,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { ReaderDocument } from "../types";
 
 type SidebarProps = {
-  recentDocuments: ReaderDocument[];
+  documents: ReaderDocument[];
   activeDocumentId?: string;
-  onOpenRecent: (document: ReaderDocument) => void;
+  onOpenDocument: (document: ReaderDocument) => void;
 };
 
 function formatRecentDate(value: string): string {
   const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "미확인";
   const today = new Date();
   if (date.toDateString() === today.toDateString()) {
     return date.toLocaleTimeString("ko-KR", {
@@ -29,18 +29,24 @@ function formatRecentDate(value: string): string {
 }
 
 export function Sidebar({
-  recentDocuments,
+  documents,
   activeDocumentId,
-  onOpenRecent,
+  onOpenDocument,
 }: SidebarProps) {
   const [query, setQuery] = useState("");
-  const filtered = useMemo(() => {
+  const visibleDocuments = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    if (!normalized) return recentDocuments;
-    return recentDocuments.filter((document) =>
-      `${document.title} ${document.filePath}`.toLocaleLowerCase().includes(normalized),
-    );
-  }, [query, recentDocuments]);
+    return [...documents]
+      .sort((left, right) =>
+        right.lastOpenedAt.localeCompare(left.lastOpenedAt),
+      )
+      .filter((document) =>
+        normalized
+          ? document.title.toLocaleLowerCase().includes(normalized)
+          : true,
+      )
+      .slice(0, 40);
+  }, [documents, query]);
 
   return (
     <aside className="sidebar">
@@ -54,59 +60,47 @@ export function Sidebar({
         <input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="파일명 검색"
-          aria-label="최근 논문 검색"
+          placeholder="논문 제목 검색"
+          aria-label="최근 논문 제목 검색"
         />
       </label>
 
-      <nav className="sidebar-nav" aria-label="논문 라이브러리">
-        <button type="button" className="nav-item nav-item--active">
-          <Clock3 size={15} />
-          최근 논문
-          <span>{recentDocuments.length}</span>
-        </button>
-        <button type="button" className="nav-item" disabled>
-          <FolderClosed size={15} />
-          논문 폴더
-          <span className="soon">NEXT</span>
-        </button>
-        <button type="button" className="nav-item" disabled>
-          <Tag size={15} />
-          태그
-          <span className="soon">NEXT</span>
-        </button>
-      </nav>
-
       <div className="sidebar-section-title">
-        <FileText size={13} />
-        최근 열어본 파일
+        {query ? <FileText size={13} /> : <Clock3 size={13} />}
+        {query ? "검색 결과" : "최근 논문"}
       </div>
 
       <div className="recent-list">
-        {filtered.length === 0 ? (
+        {visibleDocuments.length === 0 ? (
           <div className="recent-empty">
             <BookOpenText size={24} />
-            <p>{query ? "일치하는 논문이 없습니다." : "아직 연 논문이 없습니다."}</p>
+            <p>{query ? "일치하는 논문이 없습니다." : "아직 논문이 없습니다."}</p>
           </div>
         ) : (
-          filtered.map((document) => (
+          visibleDocuments.map((document) => (
             <button
               type="button"
               key={document.id}
               className={`recent-item ${
                 document.id === activeDocumentId ? "recent-item--active" : ""
               }`}
-              onClick={() => onOpenRecent(document)}
+              onClick={() => onOpenDocument(document)}
               title={document.filePath}
             >
               <span className="pdf-badge">PDF</span>
               <span className="recent-copy">
                 <strong>{document.title}</strong>
                 <small>
-                  p. {document.viewState.pageNumber}
-                  <span>·</span>
                   {formatRecentDate(document.lastOpenedAt)}
+                  <span>·</span>
+                  p. {document.viewState.pageNumber}
                 </small>
+                {(document.translationProgress ?? 0) >= 1 && (
+                  <span className="recent-translation-ready">
+                    <CheckCircle2 size={11} />
+                    한국어 논문 있음
+                  </span>
+                )}
               </span>
             </button>
           ))
@@ -115,9 +109,8 @@ export function Sidebar({
 
       <div className="sidebar-foot">
         <span className="status-dot" />
-        로컬 라이브러리
+        로컬 최근 논문 · {documents.length}
       </div>
     </aside>
   );
 }
-

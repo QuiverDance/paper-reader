@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import "../lib/pdf";
 import {
@@ -6,9 +7,36 @@ import {
   PDFLinkService,
   PDFViewer,
 } from "pdfjs-dist/web/pdf_viewer.mjs";
-import { LoaderCircle } from "lucide-react";
-import type { PaneId, ViewState } from "../types";
-import { clamp } from "../lib/reader-state";
+import {
+  ChevronLeft,
+  ChevronRight,
+  LoaderCircle,
+  Maximize2,
+  Minimize2,
+  Minus,
+  Plus,
+  RotateCw,
+} from "lucide-react";
+import type {
+  AnnotationSource,
+  DocumentBlock,
+  DocumentReference,
+  Highlight,
+  PaneId,
+  ReferenceAnchor,
+  TextSelection,
+  ViewState,
+} from "../types";
+import {
+  locateReferenceTokenRects,
+  referenceRectStyle,
+} from "../lib/pdf-pane-overlay";
+import {
+  clamp,
+  normalizeRotation,
+  scaleBy,
+  shouldApplyScrollAnchor,
+} from "../lib/reader-state";
 
 type PdfPaneProps = {
   document: PDFDocumentProxy;
@@ -17,16 +45,33 @@ type PdfPaneProps = {
   detail: string;
   targetState: ViewState;
   active: boolean;
+  blocks: DocumentBlock[];
+  highlights: Highlight[];
+  references: DocumentReference[];
+  expanded: boolean;
   onActivate: (paneId: PaneId) => void;
   onUpdate: (paneId: PaneId, update: Partial<ViewState>) => void;
+  onToggleExpand: (paneId: PaneId) => void;
+  onSelection: (selection: TextSelection) => void;
+  onWordLookup: (selection: TextSelection) => void;
+  onReferenceEnter: (
+    reference: DocumentReference,
+    anchor: ReferenceAnchor,
+    surface: AnnotationSource,
+  ) => void;
+  onReferenceLeave: () => void;
 };
 
-type PageChangingEvent = { pageNumber: number };
 type ScaleChangingEvent = {
   scale: number;
   presetValue?: string | null;
 };
 type RotationChangingEvent = { pagesRotation: number };
+type PageElement = {
+  pageNumber: number;
+  host: HTMLElement;
+  revision: number;
+};
 
 export function PdfPane({
   document,
@@ -35,9 +80,19 @@ export function PdfPane({
   detail,
   targetState,
   active,
+  blocks,
+  highlights,
+  references,
+  expanded,
   onActivate,
   onUpdate,
+  onToggleExpand,
+  onSelection,
+  onWordLookup,
+  onReferenceEnter,
+  onReferenceLeave,
 }: PdfPaneProps) {
+  const sectionRef = useRef<HTMLElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerElementRef = useRef<HTMLDivElement>(null);
   const pdfViewerRef = useRef<PDFViewer | null>(null);
@@ -45,8 +100,11 @@ export function PdfPane({
   const applyingRef = useRef(false);
   const releaseTimerRef = useRef<number | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
+  const locallyReportedAnchorRef = useRef<ViewState | null>(null);
+  const pageRevisionRef = useRef(0);
   const latestStateRef = useRef(targetState);
   const [ready, setReady] = useState(false);
+  const [pageElements, setPageElements] = useState<PageElement[]>([]);
 
   latestStateRef.current = targetState;
 
@@ -58,6 +116,30 @@ export function PdfPane({
       applyingRef.current = false;
       releaseTimerRef.current = null;
     }, 80);
+  };
+
+  const collectPageElements = () => {
+    const viewerElement = viewerElementRef.current;
+    if (!viewerElement) return;
+    pageRevisionRef.current += 1;
+    const revision = pageRevisionRef.current;
+    setPageElements(
+      Array.from(viewerElement.querySelectorAll<HTMLElement>(".page")).flatMap(
+        (element) => {
+          const pageNumber = Number(element.dataset.pageNumber);
+          if (!Number.isFinite(pageNumber)) return [];
+          let host = element.querySelector<HTMLElement>(
+            ".paper-overlay-host",
+          );
+          if (!host) {
+            host = window.document.createElement("div");
+            host.className = "paper-overlay-host";
+            element.append(host);
+          }
+          return [{ pageNumber, host, revision }];
+        },
+      ),
+    );
   };
 
   const applyAnchor = (state: ViewState) => {
@@ -73,6 +155,64 @@ export function PdfPane({
     if (Math.abs(container.scrollTop - nextTop) > 3) {
       container.scrollTop = nextTop;
     }
+  };
+
+  const captureSelection = (
+    clientX: number,
+    clientY: number,
+  ): TextSelection | null => {
+    const section = sectionRef.current;
+    const selection = window.getSelection();
+    if (!section || !selection || selection.isCollapsed || !selection.rangeCount) {
+      return null;
+    }
+    const text = selection.toString().trim();
+    if (!text) return null;
+    const range = selection.getRangeAt(0);
+    const common =
+      range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.commonAncestorContainer as Element)
+        : range.commonAncestorContainer.parentElement;
+    const page = common?.closest<HTMLElement>(".page");
+    if (!page || !section.contains(page)) return null;
+    const pageNumber = Number(page.dataset.pageNumber);
+    const pageRect = page.getBoundingClientRect();
+    const rects = Array.from(range.getClientRects())
+      .filter(
+        (rect) =>
+          rect.width > 0 &&
+          rect.height > 0 &&
+          rect.bottom >= pageRect.top &&
+          rect.top <= pageRect.bottom,
+      )
+      .map((rect) => ({
+        x: clamp((rect.left - pageRect.left) / pageRect.width, 0, 1),
+        y: clamp((rect.top - pageRect.top) / pageRect.height, 0, 1),
+        width: clamp(rect.width / pageRect.width, 0, 1),
+        height: clamp(rect.height / pageRect.height, 0, 1),
+      }));
+    if (!rects.length || !Number.isFinite(pageNumber)) return null;
+    const pageText = blocks
+      .filter((block) => block.pageNumber === pageNumber)
+      .map((block) => block.text)
+      .join(" ");
+    const selectedIndex = pageText.indexOf(text);
+    const context =
+      selectedIndex >= 0
+        ? pageText.slice(
+            Math.max(0, selectedIndex - 180),
+            selectedIndex + text.length + 180,
+          )
+        : pageText.slice(0, 600);
+    return {
+      text,
+      pageNumber,
+      source: paneId === "original" ? "original" : "translation",
+      rects,
+      context,
+      clientX,
+      clientY,
+    };
   };
 
   useEffect(() => {
@@ -104,15 +244,10 @@ export function PdfPane({
       readyRef.current = true;
       setReady(true);
       window.requestAnimationFrame(() => {
+        collectPageElements();
         applyAnchor(state);
         releaseApplying();
       });
-    };
-
-    const onPageChanging = (event: PageChangingEvent) => {
-      if (!applyingRef.current) {
-        onUpdate(paneId, { pageNumber: event.pageNumber });
-      }
     };
 
     const onScaleChanging = (event: ScaleChangingEvent) => {
@@ -130,6 +265,12 @@ export function PdfPane({
       }
     };
 
+    const onPageRendered = () => {
+      window.requestAnimationFrame(() => {
+        if (pdfViewerRef.current === viewer) collectPageElements();
+      });
+    };
+
     const reportScrollAnchor = () => {
       scrollFrameRef.current = null;
       if (applyingRef.current || !readyRef.current) return;
@@ -142,6 +283,11 @@ export function PdfPane({
         0,
         1,
       );
+      locallyReportedAnchorRef.current = {
+        ...latestStateRef.current,
+        pageNumber,
+        relativeOffsetY,
+      };
       onUpdate(paneId, { pageNumber, relativeOffsetY });
     };
 
@@ -152,19 +298,22 @@ export function PdfPane({
     };
 
     eventBus.on("pagesinit", onPagesInit);
-    eventBus.on("pagechanging", onPageChanging);
     eventBus.on("scalechanging", onScaleChanging);
     eventBus.on("rotationchanging", onRotationChanging);
+    eventBus.on("pagerendered", onPageRendered);
+    eventBus.on("textlayerrendered", onPageRendered);
     container.addEventListener("scroll", onScroll, { passive: true });
 
     return () => {
       readyRef.current = false;
       setReady(false);
+      setPageElements([]);
       container.removeEventListener("scroll", onScroll);
       eventBus.off("pagesinit", onPagesInit);
-      eventBus.off("pagechanging", onPageChanging);
       eventBus.off("scalechanging", onScaleChanging);
       eventBus.off("rotationchanging", onRotationChanging);
+      eventBus.off("pagerendered", onPageRendered);
+      eventBus.off("textlayerrendered", onPageRendered);
       if (scrollFrameRef.current !== null) {
         window.cancelAnimationFrame(scrollFrameRef.current);
       }
@@ -183,18 +332,33 @@ export function PdfPane({
     const viewer = pdfViewerRef.current;
     if (!viewer || !readyRef.current) return;
 
+    const applyScrollAnchor = shouldApplyScrollAnchor(
+      targetState,
+      locallyReportedAnchorRef.current,
+    );
+    if (!applyScrollAnchor) {
+      locallyReportedAnchorRef.current = null;
+    }
+    const rotationChanged = viewer.pagesRotation !== targetState.rotation;
+    const scaleChanged = viewer.currentScaleValue !== targetState.scaleValue;
+    if (!applyScrollAnchor && !rotationChanged && !scaleChanged) return;
+
     applyingRef.current = true;
-    if (viewer.pagesRotation !== targetState.rotation) {
+    if (rotationChanged) {
       viewer.pagesRotation = targetState.rotation;
     }
-    if (viewer.currentScaleValue !== targetState.scaleValue) {
+    if (scaleChanged) {
       viewer.currentScaleValue = targetState.scaleValue;
     }
-    if (viewer.currentPageNumber !== targetState.pageNumber) {
+    if (
+      applyScrollAnchor &&
+      viewer.currentPageNumber !== targetState.pageNumber
+    ) {
       viewer.currentPageNumber = targetState.pageNumber;
     }
     window.requestAnimationFrame(() => {
-      applyAnchor(targetState);
+      collectPageElements();
+      if (applyScrollAnchor) applyAnchor(targetState);
       releaseApplying();
     });
   }, [
@@ -206,8 +370,21 @@ export function PdfPane({
 
   return (
     <section
+      ref={sectionRef}
       className={`pdf-pane ${active ? "pdf-pane--active" : ""}`}
       onPointerDown={() => onActivate(paneId)}
+      onMouseUp={(event) => {
+        const captured = captureSelection(event.clientX, event.clientY);
+        if (captured) onSelection(captured);
+      }}
+      onDoubleClick={(event) => {
+        window.requestAnimationFrame(() => {
+          const captured = captureSelection(event.clientX, event.clientY);
+          if (captured && /^[A-Za-z][A-Za-z'-]*$/.test(captured.text)) {
+            onWordLookup(captured);
+          }
+        });
+      }}
       aria-label={`${label} PDF viewer`}
     >
       <header className="pane-header">
@@ -216,9 +393,92 @@ export function PdfPane({
           <strong>{label}</strong>
           <span>{detail}</span>
         </div>
-        <span className="pane-page">
-          {targetState.pageNumber} / {document.numPages}
-        </span>
+        <div className="pane-controls">
+          <button
+            type="button"
+            disabled={targetState.pageNumber <= 1}
+            title="이전 페이지"
+            onClick={() =>
+              onUpdate(paneId, {
+                pageNumber: targetState.pageNumber - 1,
+                relativeOffsetY: 0,
+              })
+            }
+          >
+            <ChevronLeft size={14} />
+          </button>
+          <span className="pane-page">
+            {targetState.pageNumber} / {document.numPages}
+          </span>
+          <button
+            type="button"
+            disabled={targetState.pageNumber >= document.numPages}
+            title="다음 페이지"
+            onClick={() =>
+              onUpdate(paneId, {
+                pageNumber: targetState.pageNumber + 1,
+                relativeOffsetY: 0,
+              })
+            }
+          >
+            <ChevronRight size={14} />
+          </button>
+          <button
+            type="button"
+            title="축소"
+            onClick={() => {
+              const scale = scaleBy(targetState.scale, "out");
+              onUpdate(paneId, { scale, scaleValue: String(scale) });
+            }}
+          >
+            <Minus size={13} />
+          </button>
+          <span className="pane-zoom">
+            {Math.round(targetState.scale * 100)}%
+          </span>
+          <button
+            type="button"
+            title="확대"
+            onClick={() => {
+              const scale = scaleBy(targetState.scale, "in");
+              onUpdate(paneId, { scale, scaleValue: String(scale) });
+            }}
+          >
+            <Plus size={13} />
+          </button>
+          <button
+            type="button"
+            title="너비 맞춤"
+            onClick={() => onUpdate(paneId, { scaleValue: "page-width" })}
+          >
+            너비
+          </button>
+          <button
+            type="button"
+            title="페이지 맞춤"
+            onClick={() => onUpdate(paneId, { scaleValue: "page-fit" })}
+          >
+            맞춤
+          </button>
+          <button
+            type="button"
+            title="회전"
+            onClick={() =>
+              onUpdate(paneId, {
+                rotation: normalizeRotation(targetState.rotation + 90),
+              })
+            }
+          >
+            <RotateCw size={13} />
+          </button>
+          <button
+            type="button"
+            title={expanded ? "두 논문 보기" : `${label} 크게 보기`}
+            onClick={() => onToggleExpand(paneId)}
+          >
+            {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          </button>
+        </div>
       </header>
       <div className="pdf-scroll" ref={containerRef}>
         <div className="pdfViewer" ref={viewerElementRef} />
@@ -229,6 +489,95 @@ export function PdfPane({
           </div>
         )}
       </div>
+
+      {pageElements.map(({ pageNumber, host, revision }) =>
+        createPortal(
+          <div className="paper-overlay-root" aria-hidden={false}>
+            {highlights
+              .filter(
+                (highlight) =>
+                  highlight.pageNumber === pageNumber &&
+                  highlight.source ===
+                    (paneId === "original" ? "original" : "translation"),
+              )
+              .flatMap((highlight) =>
+                highlight.rects.map((rect, index) => (
+                  <span
+                    className="highlight-overlay"
+                    key={`${highlight.id}-${index}`}
+                    style={{
+                      ...referenceRectStyle(rect, targetState.rotation),
+                      background: highlight.color,
+                    }}
+                  />
+                )),
+              )}
+
+            {references
+                .filter(
+                  (reference) => reference.sourcePageNumber === pageNumber,
+                )
+                .flatMap((reference) => {
+                  const sourceBlock = blocks.find(
+                    (block) => block.id === reference.sourceBlockId,
+                  );
+                  const pageElement = host.closest<HTMLElement>(".page");
+                  if (!sourceBlock || !pageElement) return [];
+                  return locateReferenceTokenRects(
+                    pageElement,
+                    reference.label,
+                    sourceBlock.bbox,
+                    targetState.rotation,
+                  ).map((rect, index) => (
+                    <button
+                      type="button"
+                      className="reference-hotspot"
+                      key={`${reference.id}-${index}`}
+                      style={referenceRectStyle(rect, 0)}
+                      disabled={!reference.targetPageNumber}
+                      onMouseEnter={(event) => {
+                        const anchor =
+                          event.currentTarget.getBoundingClientRect();
+                        onReferenceEnter(
+                          reference,
+                          {
+                            left: anchor.left,
+                            top: anchor.top,
+                            right: anchor.right,
+                            bottom: anchor.bottom,
+                            width: anchor.width,
+                            height: anchor.height,
+                          },
+                          paneId === "original" ? "original" : "translation",
+                        );
+                      }}
+                      onMouseLeave={onReferenceLeave}
+                      onFocus={(event) => {
+                        const anchor =
+                          event.currentTarget.getBoundingClientRect();
+                        onReferenceEnter(
+                          reference,
+                          {
+                            left: anchor.left,
+                            top: anchor.top,
+                            right: anchor.right,
+                            bottom: anchor.bottom,
+                            width: anchor.width,
+                            height: anchor.height,
+                          },
+                          paneId === "original" ? "original" : "translation",
+                        );
+                      }}
+                      onBlur={onReferenceLeave}
+                      aria-label={`${reference.label} 미리보기`}
+                    />
+                  ));
+                })}
+          </div>,
+          host,
+          `${paneId}-${pageNumber}-${revision}`,
+        ),
+      )}
     </section>
   );
 }

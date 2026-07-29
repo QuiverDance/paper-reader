@@ -1,285 +1,299 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { PDFDocumentProxy } from "pdfjs-dist";
-import { AlertCircle, FileWarning, LoaderCircle, X } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  AlertCircle,
+  Bookmark,
+  Download,
+  FileWarning,
+  LoaderCircle,
+  MessageSquareText,
+  Pencil,
+  RefreshCw,
+  StickyNote,
+  X,
+} from "lucide-react";
 import { EmptyReader } from "./components/EmptyReader";
+import { FigurePreview } from "./components/FigurePreview";
+import { KoreanPaperEmpty } from "./components/KoreanPaperEmpty";
+import { KoreanPaperEditor } from "./components/KoreanPaperEditor";
 import { PdfPane } from "./components/PdfPane";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { Sidebar } from "./components/Sidebar";
 import { ToolRail } from "./components/ToolRail";
 import { TopBar } from "./components/TopBar";
-import { extractPdfTitle, loadPdfDocument } from "./lib/pdf";
+import { useDictionaryLookup } from "./hooks/useDictionaryLookup";
+import { useDocumentSession } from "./hooks/useDocumentSession";
+import { useKoreanPaperCreation } from "./hooks/useKoreanPaperCreation";
+import { useModelSettings } from "./hooks/useModelSettings";
+import { usePaperAsk } from "./hooks/usePaperAsk";
 import {
-  DEFAULT_VIEW_STATE,
-  mergeViewState,
-  normalizeAnchor,
-  normalizeRotation,
-  scaleBy,
-} from "./lib/reader-state";
-import {
-  fileNameFromPath,
-  readPdfFromPath,
-  runningInTauri,
-  selectPdfPath,
-  stableDocumentId,
-} from "./lib/platform";
-import {
-  findDocument,
-  listRecentDocuments,
-  makeReaderDocument,
-  saveDocument,
-  updateReadingState,
-} from "./lib/storage";
+  buildReferenceCatalog,
+  buildSourceReferenceIndex,
+} from "./lib/reference-catalog";
+import { observeClearedTextSelection } from "./lib/selection-toolbar";
 import type {
+  AnnotationSource,
+  DocumentReference,
+  LlmSettings,
+  LlmUsageByPhase,
   PaneId,
-  ReaderDocument,
-  SplitMode,
-  ViewState,
+  ReferenceAnchor,
+  ReadingToolTab,
+  TextSelection,
 } from "./types";
 
-type PaneStates = Record<PaneId, ViewState>;
-
-const INITIAL_PANE_STATES: PaneStates = {
-  original: DEFAULT_VIEW_STATE,
-  companion: DEFAULT_VIEW_STATE,
-};
+function tokenUsageLabel(usage: LlmUsageByPhase): string {
+  const suffix = usage.total.estimated ? " · 추정" : "";
+  return `구조 ${usage.structure.totalTokens.toLocaleString()} · 번역 ${usage.translation.totalTokens.toLocaleString()} · 합계 ${usage.total.totalTokens.toLocaleString()} 토큰${suffix}`;
+}
 
 function App() {
-  const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null);
-  const [readerDocument, setReaderDocument] = useState<ReaderDocument | null>(null);
-  const [paneStates, setPaneStates] = useState<PaneStates>(INITIAL_PANE_STATES);
   const [activePane, setActivePane] = useState<PaneId>("original");
-  const [splitMode, setSplitMode] = useState<SplitMode>("side-by-side");
-  const [syncEnabled, setSyncEnabled] = useState(true);
-  const [recentDocuments, setRecentDocuments] = useState<ReaderDocument[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [expandedPane, setExpandedPane] = useState<PaneId | null>(null);
+  const [settings, setSettings] = useState<LlmSettings | null>(null);
+  const [selection, setSelection] = useState<TextSelection | null>(null);
+  const [selectedReference, setSelectedReference] = useState<{
+    reference: DocumentReference;
+    anchor: ReferenceAnchor;
+    surface: AnnotationSource;
+  } | null>(null);
+  const [toolTab, setToolTab] = useState<ReadingToolTab>("ask");
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
   const browserInputRef = useRef<HTMLInputElement>(null);
-  const currentPdfRef = useRef<PDFDocumentProxy | null>(null);
-  const saveTimerRef = useRef<number | null>(null);
-
-  const activeState = paneStates[activePane];
-  const pageCount = pdfDocument?.numPages ?? 0;
-
-  const refreshRecent = useCallback(async () => {
-    try {
-      setRecentDocuments(await listRecentDocuments());
-    } catch {
-      // The reader remains usable if persistence is temporarily unavailable.
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshRecent();
-    return () => {
-      if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
-      void currentPdfRef.current?.cleanup();
-    };
-  }, [refreshRecent]);
-
-  useEffect(() => {
-    if (!readerDocument) return;
-    if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = window.setTimeout(() => {
-      void updateReadingState(
-        readerDocument.id,
-        paneStates.original,
-        splitMode,
-        syncEnabled,
-      ).then(refreshRecent);
-    }, 450);
-    return () => {
-      if (saveTimerRef.current !== null) {
-        window.clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
-    };
-  }, [
-    paneStates.original,
+  const referenceCloseTimerRef = useRef<number | null>(null);
+  const requestBrowserFile = useCallback(
+    () => browserInputRef.current?.click(),
+    [],
+  );
+  const {
+    pdfDocument,
     readerDocument,
-    refreshRecent,
-    splitMode,
-    syncEnabled,
-  ]);
+    documents,
+    blocks,
+    highlights,
+    notes,
+    hydration,
+    paneStates,
+    loading,
+    analyzing,
+    analysisProgress,
+    getActiveDocumentId,
+    getSourceBytes,
+    openPdf,
+    openBrowserFile,
+    openLibraryDocument,
+    prepareCompanion,
+    updatePane,
+    updateDocument,
+    addHighlight: addSessionHighlight,
+    addNote: addSessionNote,
+    updateNote,
+    removeNote,
+    removeHighlight,
+  } = useDocumentSession({
+    settings,
+    onSettingsChange: setSettings,
+    requestBrowserFile,
+    onError: setError,
+    onNotice: setNotice,
+  });
+  const {
+    entry: dictionaryEntry,
+    loading: dictionaryLoading,
+    lookup: lookupWord,
+    close: closeDictionary,
+  } = useDictionaryLookup({
+    document: readerDocument,
+    settings,
+    getActiveDocumentId,
+    onError: setError,
+  });
 
-  const installDocument = useCallback(
-    async (bytes: Uint8Array, filePath: string) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const id = stableDocumentId(filePath);
-        const [document, previous] = await Promise.all([
-          loadPdfDocument(bytes),
-          findDocument(id),
-        ]);
-        const fallback = fileNameFromPath(filePath);
-        const title = await extractPdfTitle(document, fallback);
-        const nextReaderDocument = makeReaderDocument(
-          id,
-          filePath,
-          title,
-          document.numPages,
-          previous,
-        );
-        const restored = mergeViewState(
-          DEFAULT_VIEW_STATE,
-          previous?.viewState ?? DEFAULT_VIEW_STATE,
-          document.numPages,
-        );
+  const sourceReferenceIndex = useMemo(
+    () => buildSourceReferenceIndex(blocks),
+    [blocks],
+  );
+  const semanticPaper = sourceReferenceIndex.paper;
+  const references = sourceReferenceIndex.references;
+  const {
+    document: koreanDocument,
+    blocks: koreanBlocks,
+    translations,
+    project: retypesetProject,
+    build: koreanBuild,
+    editing: editingKorean,
+    setEditing: setEditingKorean,
+    replaceProject: setRetypesetProject,
+    buildPaper: buildKoreanPaper,
+    applyEdits: applyKoreanEdits,
+    exportPaper: exportKoreanPaper,
+  } = useKoreanPaperCreation({
+    document: readerDocument,
+    settings,
+    sourceBlocks: blocks,
+    paper: semanticPaper,
+    references,
+    hydration,
+    getSourceBytes,
+    getActiveDocumentId,
+    onSettingsChange: setSettings,
+    onDocumentChange: updateDocument,
+    onCompanionReady: prepareCompanion,
+    onError: setError,
+    onNotice: setNotice,
+  });
+  const {
+    activeProfile,
+    models: paperModels,
+    activeModelId,
+    effortOptions,
+    open: settingsOpen,
+    testing: settingsTesting,
+    setOpen: setSettingsOpen,
+    selectModel: selectPaperModel,
+    selectEffort: selectReasoningEffort,
+    save: saveSettings,
+    test: testSettings,
+  } = useModelSettings({
+    settings,
+    onSettingsChange: setSettings,
+    document: readerDocument,
+    onDocumentChange: updateDocument,
+    project: retypesetProject,
+    onProjectChange: setRetypesetProject,
+    onError: setError,
+    onNotice: setNotice,
+  });
+  const referenceCatalog = useMemo(
+    () =>
+      buildReferenceCatalog({
+        source: sourceReferenceIndex,
+        translatedBlocks: koreanBlocks,
+        translations,
+      }),
+    [koreanBlocks, sourceReferenceIndex, translations],
+  );
+  const koreanReferences = referenceCatalog.translation;
+  const activateAsk = useCallback(() => setToolTab("ask"), []);
+  const {
+    sessions,
+    asking,
+    streamingAnswer,
+    ask: askQuestion,
+  } = usePaperAsk({
+    document: readerDocument,
+    settings,
+    pageCount: pdfDocument?.numPages ?? 0,
+    blocks,
+    paper: semanticPaper,
+    selection,
+    project: retypesetProject,
+    hydration,
+    getPdfBytes: getSourceBytes,
+    getActiveDocumentId,
+    onProjectChange: setRetypesetProject,
+    onError: setError,
+    onActivate: activateAsk,
+  });
 
-        const oldDocument = currentPdfRef.current;
-        currentPdfRef.current = document;
-        setPdfDocument(document);
-        setReaderDocument(nextReaderDocument);
-        setPaneStates({ original: restored, companion: restored });
-        setSplitMode(nextReaderDocument.splitMode);
-        setSyncEnabled(nextReaderDocument.syncEnabled);
-        setActivePane("original");
-        await saveDocument(nextReaderDocument);
-        await refreshRecent();
-        if (oldDocument) void oldDocument.cleanup();
-      } catch (cause) {
-        const message =
-          cause instanceof Error ? cause.message : String(cause);
-        setError(message || "PDF를 열지 못했습니다.");
-      } finally {
-        setLoading(false);
+  useEffect(() => {
+    return () => {
+      if (referenceCloseTimerRef.current !== null) {
+        window.clearTimeout(referenceCloseTimerRef.current);
       }
-    },
-    [refreshRecent],
-  );
-
-  const openPdf = useCallback(async () => {
-    setError(null);
-    if (!runningInTauri()) {
-      browserInputRef.current?.click();
-      return;
-    }
-    try {
-      const path = await selectPdfPath();
-      if (!path) return;
-      const bytes = await readPdfFromPath(path);
-      await installDocument(bytes, path);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  }, [installDocument]);
-
-  const openBrowserFile = useCallback(
-    async (file: File | undefined) => {
-      if (!file) return;
-      if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
-        setError("PDF 파일만 열 수 있습니다.");
-        return;
-      }
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      await installDocument(bytes, `browser://${file.name}`);
-    },
-    [installDocument],
-  );
-
-  const openRecent = useCallback(
-    async (document: ReaderDocument) => {
-      if (document.filePath.startsWith("browser://")) {
-        setError("브라우저에서 연 파일은 다시 선택해 주세요.");
-        browserInputRef.current?.click();
-        return;
-      }
-      setLoading(true);
-      setError(null);
-      try {
-        const bytes = await readPdfFromPath(document.filePath);
-        await installDocument(bytes, document.filePath);
-      } catch (cause) {
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "파일을 다시 열지 못했습니다.",
-        );
-        setLoading(false);
-      }
-    },
-    [installDocument],
-  );
-
-  const updatePane = useCallback(
-    (paneId: PaneId, update: Partial<ViewState>) => {
-      if (!pageCount) return;
-      setPaneStates((current) => {
-        const next = mergeViewState(current[paneId], update, pageCount);
-        if (syncEnabled) {
-          return { original: next, companion: next };
-        }
-        return { ...current, [paneId]: next };
-      });
-    },
-    [pageCount, syncEnabled],
-  );
-
-  const updateFromToolbar = useCallback(
-    (update: Partial<ViewState>) => {
-      if (!pageCount) return;
-      setPaneStates((current) => {
-        const next = mergeViewState(current[activePane], update, pageCount);
-        if (syncEnabled) return { original: next, companion: next };
-        return { ...current, [activePane]: next };
-      });
-    },
-    [activePane, pageCount, syncEnabled],
-  );
-
-  const setPage = useCallback(
-    (pageNumber: number) => {
-      const anchor = normalizeAnchor({ pageNumber, relativeOffsetY: 0 }, pageCount);
-      updateFromToolbar(anchor);
-    },
-    [pageCount, updateFromToolbar],
-  );
-
-  const setZoom = useCallback(
-    (direction: "in" | "out") => {
-      const scale = scaleBy(activeState.scale, direction);
-      updateFromToolbar({ scale, scaleValue: String(scale) });
-    },
-    [activeState.scale, updateFromToolbar],
-  );
-
-  const setFit = useCallback(
-    (scaleValue: "page-width" | "page-fit") => {
-      updateFromToolbar({ scaleValue });
-    },
-    [updateFromToolbar],
-  );
-
-  const rotate = useCallback(() => {
-    updateFromToolbar({ rotation: normalizeRotation(activeState.rotation + 90) });
-  }, [activeState.rotation, updateFromToolbar]);
-
-  const toggleSync = useCallback(() => {
-    setSyncEnabled((enabled) => {
-      if (!enabled) {
-        setPaneStates((current) => ({
-          original: current[activePane],
-          companion: current[activePane],
-        }));
-      }
-      return !enabled;
-    });
-  }, [activePane]);
-
-  const changeSplitMode = useCallback((mode: SplitMode) => {
-    setSplitMode(mode);
-    if (mode === "single") setActivePane("original");
+    };
   }, []);
 
-  const statusText = useMemo(() => {
-    if (!readerDocument) return "준비됨";
-    const viewLabel =
-      splitMode === "single"
-        ? "원문"
-        : splitMode === "side-by-side"
-          ? "좌우 분할"
-          : "상하 분할";
-    return `${viewLabel} · ${syncEnabled ? "동기화됨" : "독립 보기"}`;
-  }, [readerDocument, splitMode, syncEnabled]);
+  useEffect(
+    () =>
+      observeClearedTextSelection(
+        document,
+        () => window.getSelection(),
+        () => setSelection(null),
+      ),
+    [],
+  );
+
+  useEffect(() => {
+    setSelection(null);
+    setActivePane("original");
+    setExpandedPane(null);
+  }, [readerDocument?.id]);
+
+  const addHighlightFromSelection = useCallback(
+    async (color: string) => {
+      if (!selection) return;
+      await addSessionHighlight(selection, color);
+      setToolTab("highlights");
+      window.getSelection()?.removeAllRanges();
+      setSelection(null);
+    },
+    [addSessionHighlight, selection],
+  );
+
+  const addNote = useCallback(
+    async (markdown: string) => {
+      await addSessionNote(markdown, selection);
+      setToolTab("notes");
+    },
+    [addSessionNote, selection],
+  );
+
+  const saveAnswerAsNote = useCallback(
+    async (answer: string) => {
+      await addNote(`## Ask 답변\n\n${answer}`);
+    },
+    [addNote],
+  );
+
+  const goToSourcePage = useCallback(
+    (pageNumber: number) => {
+      updatePane("original", { pageNumber, relativeOffsetY: 0 });
+      setActivePane("original");
+      if (expandedPane === "companion") setExpandedPane(null);
+    },
+    [expandedPane, updatePane],
+  );
+
+  const keepReferencePreviewOpen = useCallback(() => {
+    if (referenceCloseTimerRef.current !== null) {
+      window.clearTimeout(referenceCloseTimerRef.current);
+      referenceCloseTimerRef.current = null;
+    }
+  }, []);
+
+  const openReferencePreview = useCallback(
+    (
+      reference: DocumentReference,
+      anchor: ReferenceAnchor,
+      surface: AnnotationSource,
+    ) => {
+      keepReferencePreviewOpen();
+      setSelectedReference({ reference, anchor, surface });
+    },
+    [keepReferencePreviewOpen],
+  );
+
+  const scheduleReferencePreviewClose = useCallback(() => {
+    keepReferencePreviewOpen();
+    referenceCloseTimerRef.current = window.setTimeout(() => {
+      setSelectedReference(null);
+      referenceCloseTimerRef.current = null;
+    }, 150);
+  }, [keepReferencePreviewOpen]);
+
+  const statusText = readerDocument
+    ? `원문·한국어 독립 보기 · ${
+        koreanDocument ? "저장된 한국어 논문" : "한국어 논문 미생성"
+      }`
+    : "준비됨";
 
   return (
     <div className="app-shell">
@@ -297,24 +311,21 @@ function App() {
       <TopBar
         hasDocument={Boolean(pdfDocument)}
         title={readerDocument?.title ?? ""}
-        pageCount={pageCount}
-        viewState={activeState}
-        splitMode={splitMode}
-        syncEnabled={syncEnabled}
+        models={paperModels}
+        activeModelId={activeModelId}
+        effortOptions={effortOptions}
+        effort={settings?.effort ?? "default"}
         onOpen={() => void openPdf()}
-        onPage={setPage}
-        onZoom={setZoom}
-        onFit={setFit}
-        onRotate={rotate}
-        onSplitMode={changeSplitMode}
-        onToggleSync={toggleSync}
+        onModel={(modelId) => void selectPaperModel(modelId)}
+        onEffort={(effort) => void selectReasoningEffort(effort)}
+        onSettings={() => setSettingsOpen(true)}
       />
 
       <div className="workspace">
         <Sidebar
-          recentDocuments={recentDocuments}
+          documents={documents}
           activeDocumentId={readerDocument?.id}
-          onOpenRecent={(document) => void openRecent(document)}
+          onOpenDocument={(document) => void openLibraryDocument(document)}
         />
 
         <div className="reader-region">
@@ -327,38 +338,159 @@ function App() {
               </button>
             </div>
           )}
+          {notice && (
+            <div className="notice-banner" role="status">
+              <span>{notice}</span>
+              <button type="button" onClick={() => setNotice(null)} aria-label="닫기">
+                <X size={15} />
+              </button>
+            </div>
+          )}
 
-          {loading && (
+          {(loading || analyzing) && (
             <div className="global-loading">
               <LoaderCircle className="spin" size={22} />
-              <span>논문을 여는 중</span>
+              <span>
+                {loading
+                  ? "논문을 여는 중"
+                  : `논문 구조 분석 중 · ${Math.round(analysisProgress * 100)}%`}
+              </span>
             </div>
           )}
 
           {!pdfDocument ? (
             <EmptyReader onOpen={() => void openPdf()} />
           ) : (
-            <main className={`reader-grid reader-grid--${splitMode}`}>
+            <main
+              className={`reader-grid reader-grid--bilingual ${
+                expandedPane ? `reader-grid--expanded-${expandedPane}` : ""
+              }`}
+            >
               <PdfPane
                 document={pdfDocument}
                 paneId="original"
-                label="원문"
+                label="영어 원문"
                 detail={readerDocument?.title ?? ""}
                 targetState={paneStates.original}
                 active={activePane === "original"}
+                expanded={expandedPane === "original"}
+                blocks={blocks}
+                highlights={highlights}
+                references={references}
                 onActivate={setActivePane}
                 onUpdate={updatePane}
+                onToggleExpand={(paneId) =>
+                  setExpandedPane((current) =>
+                    current === paneId ? null : paneId,
+                  )
+                }
+                onSelection={setSelection}
+                onWordLookup={(nextSelection) => void lookupWord(nextSelection)}
+                onReferenceEnter={openReferencePreview}
+                onReferenceLeave={scheduleReferencePreviewClose}
               />
-              {splitMode !== "single" && (
-                <PdfPane
-                  document={pdfDocument}
-                  paneId="companion"
-                  label="번역 뷰"
-                  detail="원문 미러 · 번역 레이어 준비"
-                  targetState={paneStates.companion}
-                  active={activePane === "companion"}
-                  onActivate={setActivePane}
-                  onUpdate={updatePane}
+
+              {koreanDocument ? (
+                <div className="korean-pane-shell">
+                  <div className="korean-pane-actions">
+                    {retypesetProject?.tokenUsage && (
+                      <small className="korean-token-usage">
+                        {tokenUsageLabel(retypesetProject.tokenUsage)}
+                      </small>
+                    )}
+                    <button
+                      type="button"
+                      disabled={koreanBuild.phase !== "idle"}
+                      onClick={() => setEditingKorean(true)}
+                    >
+                      <Pencil size={14} />
+                      내용 수정
+                    </button>
+                    <button
+                      type="button"
+                      disabled={koreanBuild.phase !== "idle"}
+                      onClick={() => void exportKoreanPaper()}
+                    >
+                      <Download size={14} />
+                      PDF 내보내기
+                    </button>
+                    <button
+                      type="button"
+                      disabled={koreanBuild.phase !== "idle"}
+                      onClick={() => void buildKoreanPaper(true)}
+                    >
+                      <RefreshCw size={14} />
+                      다시 만들기
+                    </button>
+                  </div>
+                  {koreanBuild.phase !== "idle" && (
+                    <div className="korean-build-banner" role="status">
+                      <LoaderCircle className="spin" size={14} />
+                      <span>{koreanBuild.message}</span>
+                      {koreanBuild.total > 0 && (
+                        <small>
+                          {koreanBuild.completed} / {koreanBuild.total}
+                        </small>
+                      )}
+                      {koreanBuild.tokenUsage && (
+                        <small>
+                          {tokenUsageLabel(koreanBuild.tokenUsage)}
+                        </small>
+                      )}
+                    </div>
+                  )}
+                  <PdfPane
+                    document={koreanDocument}
+                    paneId="companion"
+                    label="한국어 논문"
+                    detail="자동 생성된 로컬 재조판본"
+                    targetState={paneStates.companion}
+                    active={activePane === "companion"}
+                    expanded={expandedPane === "companion"}
+                    blocks={koreanBlocks}
+                    highlights={highlights}
+                    references={koreanReferences}
+                    onActivate={setActivePane}
+                    onUpdate={updatePane}
+                    onToggleExpand={(paneId) =>
+                      setExpandedPane((current) =>
+                        current === paneId ? null : paneId,
+                      )
+                    }
+                    onSelection={setSelection}
+                    onWordLookup={(nextSelection) =>
+                      void lookupWord(nextSelection)
+                    }
+                    onReferenceEnter={openReferencePreview}
+                    onReferenceLeave={scheduleReferencePreviewClose}
+                  />
+                  {editingKorean && (
+                    <KoreanPaperEditor
+                      key={retypesetProject?.updatedAt ?? "editor"}
+                      blocks={
+                        retypesetProject?.documentStructure?.blocks ??
+                        blocks
+                      }
+                      translations={translations}
+                      saving={koreanBuild.phase !== "idle"}
+                      onCancel={() => setEditingKorean(false)}
+                      onSave={(edits) => void applyKoreanEdits(edits)}
+                    />
+                  )}
+                </div>
+              ) : (
+                <KoreanPaperEmpty
+                  analyzing={analyzing || !blocks.length}
+                  working={koreanBuild.phase !== "idle"}
+                  progressMessage={koreanBuild.message}
+                  completed={koreanBuild.completed}
+                  total={koreanBuild.total}
+                  tokenUsage={
+                    koreanBuild.tokenUsage ??
+                    retypesetProject?.tokenUsage
+                  }
+                  modelName={activeProfile?.name ?? ""}
+                  onCreate={() => void buildKoreanPaper(false)}
                 />
               )}
             </main>
@@ -378,19 +510,125 @@ function App() {
                 </>
               )}
             </span>
-            <span>{readerDocument?.filePath ?? "원본 파일은 수정되지 않습니다"}</span>
+            <span>
+              {readerDocument?.filePath ?? "원본 파일은 수정되지 않습니다"}
+            </span>
             <span>
               {readerDocument
-                ? `p. ${paneStates.original.pageNumber} · ${Math.round(
-                    paneStates.original.scale * 100,
-                  )}% · ${paneStates.original.rotation}°`
-                : "Paperloom 0.1.0"}
+                ? `원문 p.${paneStates.original.pageNumber} · 한국어 ${
+                    koreanDocument ? `p.${paneStates.companion.pageNumber}` : "—"
+                  }`
+                : "Paperloom 0.3.0"}
             </span>
           </footer>
         </div>
 
-        <ToolRail />
+        <ToolRail
+          activeTab={toolTab}
+          hasDocument={Boolean(readerDocument)}
+          selection={selection}
+          highlights={highlights}
+          notes={notes}
+          sessions={sessions}
+          references={references}
+          dictionaryEntry={dictionaryEntry}
+          dictionaryLoading={dictionaryLoading}
+          asking={asking}
+          streamingAnswer={streamingAnswer}
+          error={null}
+          onTab={setToolTab}
+          onAsk={(question) => void askQuestion(question)}
+          onCopy={(text) => void navigator.clipboard.writeText(text)}
+          onSaveAnswerAsNote={(text) => void saveAnswerAsNote(text)}
+          onAddNote={(markdown) => void addNote(markdown)}
+          onUpdateNote={(note, markdown) => void updateNote(note, markdown)}
+          onDeleteNote={(id) => void removeNote(id)}
+          onDeleteHighlight={(id) => void removeHighlight(id)}
+          onGoToPage={goToSourcePage}
+          onOpenReference={(reference) =>
+            openReferencePreview(
+              reference,
+              {
+                left: window.innerWidth - 340,
+                top: 104,
+                right: window.innerWidth - 320,
+                bottom: 120,
+                width: 20,
+                height: 16,
+              },
+              "original",
+            )
+          }
+          onCloseDictionary={closeDictionary}
+        />
       </div>
+
+      {selection && (
+        <div
+          className="selection-toolbar"
+          onPointerDown={(event) => event.preventDefault()}
+          style={{
+            left: Math.min(selection.clientX, window.innerWidth - 230),
+            top: Math.max(64, selection.clientY - 52),
+          }}
+        >
+          <button
+            type="button"
+            title="하이라이트"
+            onClick={() =>
+              void addHighlightFromSelection("rgba(255, 214, 92, .42)")
+            }
+          >
+            <Bookmark size={14} />
+          </button>
+          <button
+            type="button"
+            title="메모"
+            onClick={() => setToolTab("notes")}
+          >
+            <StickyNote size={14} />
+          </button>
+          <button type="button" title="질문 초점으로 사용" onClick={() => setToolTab("ask")}>
+            <MessageSquareText size={14} />
+          </button>
+          <button
+            type="button"
+            title="선택 메뉴 닫기"
+            onClick={() => setSelection(null)}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      {settingsOpen && settings && (
+        <SettingsDialog
+          settings={settings}
+          testing={settingsTesting}
+          onClose={() => setSettingsOpen(false)}
+          onSave={(next) => void saveSettings(next)}
+          onTest={(draft) => void testSettings(draft)}
+        />
+      )}
+
+      {selectedReference && pdfDocument && (
+        <FigurePreview
+          document={pdfDocument}
+          reference={selectedReference.reference}
+          anchor={selectedReference.anchor}
+          caption={referenceCatalog.previewCaption(
+            selectedReference.reference,
+            selectedReference.surface,
+          )}
+          onEnter={keepReferencePreviewOpen}
+          onLeave={scheduleReferencePreviewClose}
+          onGoToPage={(pageNumber) => {
+            goToSourcePage(pageNumber);
+            setSelectedReference(null);
+          }}
+        />
+      )}
+
     </div>
   );
 }

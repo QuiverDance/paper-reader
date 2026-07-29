@@ -1,7 +1,10 @@
 node_modules
 dist
 .vite
+.scratch
 src-tauri/target
+src-tauri/gen
+tmp/
+output/
 *.log
 .DS_Store
-
