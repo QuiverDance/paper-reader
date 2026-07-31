@@ -3,7 +3,6 @@ import {
   CircleAlert,
   Eye,
   EyeOff,
-  FileUp,
   LoaderCircle,
   LogIn,
   Plus,
@@ -13,7 +12,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   applyModelProfile,
   getCodexAuthStatus,
@@ -21,7 +20,6 @@ import {
   startCodexLogin,
   type CodexAuthStatus,
 } from "../lib/llm";
-import { importOpenCodeConfig } from "../lib/opencode-config";
 import type {
   LlmSettings,
   ModelConnectionProfile,
@@ -44,11 +42,8 @@ export function SettingsDialog({
 }: SettingsDialogProps) {
   const [draft, setDraft] = useState(() => normalizeLlmSettings(settings));
   const [showKey, setShowKey] = useState(false);
-  const [configText, setConfigText] = useState("");
-  const [importMessage, setImportMessage] = useState("");
   const [codexStatus, setCodexStatus] = useState<CodexAuthStatus | null>(null);
   const [codexBusy, setCodexBusy] = useState(false);
-  const configFileRef = useRef<HTMLInputElement>(null);
 
   const activeProfile =
     draft.profiles.find((profile) => profile.id === draft.activeProfileId) ??
@@ -79,7 +74,6 @@ export function SettingsDialog({
       | "apiKey"
       | "model"
       | "codexModel"
-      | "targetLanguage"
       | "instructions",
     value: string,
   ) => {
@@ -133,38 +127,6 @@ export function SettingsDialog({
     } finally {
       setCodexBusy(false);
     }
-  };
-
-  const applyOpenCodeConfig = () => {
-    try {
-      const imported = importOpenCodeConfig(configText);
-      updateProfile({
-        connectionMode: "api",
-        endpoint: imported.endpoint,
-        apiKey: imported.apiKey,
-        model: imported.model,
-        maxContextSize: imported.maxContextSize ?? activeProfile.maxContextSize,
-        effort:
-          imported.effort === "low" ||
-          imported.effort === "high" ||
-          imported.effort === "max"
-            ? imported.effort
-            : activeProfile.effort,
-        capabilities: imported.capabilities ?? activeProfile.capabilities,
-      });
-      setImportMessage(
-        `${imported.modelAlias} → ${imported.model} (${imported.providerName}) 설정을 가져왔습니다.`,
-      );
-    } catch (cause) {
-      setImportMessage(cause instanceof Error ? cause.message : String(cause));
-    }
-  };
-
-  const loadConfigFile = async (file?: File) => {
-    if (!file) return;
-    const contents = await file.text();
-    setConfigText(contents);
-    setImportMessage(`${file.name} 파일을 읽었습니다. 설정 적용을 눌러 주세요.`);
   };
 
   return (
@@ -288,61 +250,6 @@ export function SettingsDialog({
 
         {draft.connectionMode === "api" ? (
           <>
-            <details className="opencode-import">
-              <summary>OpenCode TOML 설정 가져오기</summary>
-              <div className="opencode-import-body">
-                <input
-                  ref={configFileRef}
-                  type="file"
-                  accept=".toml,text/plain"
-                  hidden
-                  onChange={(event) => {
-                    void loadConfigFile(event.target.files?.[0]);
-                    event.currentTarget.value = "";
-                  }}
-                />
-                <textarea
-                  value={configText}
-                  onChange={(event) => {
-                    setConfigText(event.target.value);
-                    setImportMessage("");
-                  }}
-                  spellCheck={false}
-                  placeholder={`default_model = "glm-5.2-nvfp4"
-
-[providers.openai]
-type = "openai"
-base_url = "https://example.com/v1"
-api_key = "..."
-
-[models."glm-5.2-nvfp4"]
-provider = "openai"
-model = "nvidia/GLM-5.2-NVFP4"`}
-                />
-                <div className="opencode-import-actions">
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    onClick={() => configFileRef.current?.click()}
-                  >
-                    <FileUp size={14} />
-                    TOML 파일 선택
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    disabled={!configText.trim()}
-                    onClick={applyOpenCodeConfig}
-                  >
-                    설정 적용
-                  </button>
-                </div>
-                {importMessage && (
-                  <p className="inline-status">{importMessage}</p>
-                )}
-              </div>
-            </details>
-
             <label>
               <span>API endpoint</span>
               <input
@@ -417,10 +324,64 @@ model = "nvidia/GLM-5.2-NVFP4"`}
               </label>
             </div>
 
+            <div className="settings-capabilities">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={activeProfile.capabilities.includes("pdf-input")}
+                  onChange={(event) => {
+                    const withoutPdf = activeProfile.capabilities.filter(
+                      (capability) =>
+                        capability !== "pdf-input" &&
+                        capability !== "remote-file-delete",
+                    );
+                    updateProfile({
+                      capabilities: event.target.checked
+                        ? [...withoutPdf, "pdf-input"]
+                        : withoutPdf,
+                    });
+                  }}
+                />
+                <span>
+                  <strong>원본 PDF 질문 입력</strong>
+                  <small>
+                    이 제공자가 Responses API의 PDF 파일 입력을 지원할 때만
+                    켜세요.
+                  </small>
+                </span>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  disabled={!activeProfile.capabilities.includes("pdf-input")}
+                  checked={activeProfile.capabilities.includes(
+                    "remote-file-delete",
+                  )}
+                  onChange={(event) => {
+                    const capabilities = activeProfile.capabilities.filter(
+                      (capability) => capability !== "remote-file-delete",
+                    );
+                    updateProfile({
+                      capabilities: event.target.checked
+                        ? [...capabilities, "remote-file-delete"]
+                        : capabilities,
+                    });
+                  }}
+                />
+                <span>
+                  <strong>원격 파일 삭제 지원</strong>
+                  <small>
+                    프로젝트 삭제 시 제공자의 파일 삭제 API를 호출할 수
+                    있습니다.
+                  </small>
+                </span>
+              </label>
+            </div>
+
             <p className="settings-security">
-              OpenCode 설정을 가져오면 기본 모델의 별칭을 따라 provider,
-              base_url, api_key, 실제 model 값을 자동으로 연결합니다. 키는 이
-              장치에만 저장되며 로그에 출력하지 않습니다.
+              API 키는 이 장치의 보안 저장소에만 저장되며 로그에 출력하지
+              않습니다. PDF 입력 지원 여부는 호환 endpoint 이름만으로
+              추정하지 않습니다.
             </p>
           </>
         ) : (
@@ -493,27 +454,17 @@ model = "nvidia/GLM-5.2-NVFP4"`}
           </>
         )}
 
-        <div className="settings-row">
-          <label>
-            <span>번역 언어</span>
-            <input
-              value={draft.targetLanguage}
-              onChange={(event) => update("targetLanguage", event.target.value)}
-              placeholder="ko"
-            />
-          </label>
-          <label>
-            <span>연결 방식</span>
-            <input
-              value={
-                draft.connectionMode === "codex"
-                  ? "ChatGPT / Codex"
-                  : "OpenAI 호환 API"
-              }
-              readOnly
-            />
-          </label>
-        </div>
+        <label>
+          <span>연결 방식</span>
+          <input
+            value={
+              draft.connectionMode === "codex"
+                ? "ChatGPT / Codex"
+                : "OpenAI 호환 API"
+            }
+            readOnly
+          />
+        </label>
 
         <label>
           <span>추가 번역 지침</span>

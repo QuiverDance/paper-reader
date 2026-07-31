@@ -1,7 +1,8 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import type { ScannedPdfFile } from "../types";
 
 type BinaryResponse = ArrayBuffer | Uint8Array | number[];
+const ARTIFACT_DATABASE = "paperloom-artifacts";
+const ARTIFACT_STORE = "accepted-pdfs";
 
 export function runningInTauri(): boolean {
   return isTauri();
@@ -18,6 +19,80 @@ export async function readPdfFromPath(filePath: string): Promise<Uint8Array> {
   return new Uint8Array(response);
 }
 
+export async function hashPdfBytes(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes.slice().buffer);
+  return [...new Uint8Array(digest)]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export function documentIdFromHash(fileHash: string): string {
+  return `pdf_${fileHash.toLowerCase()}`;
+}
+
+function openArtifactDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(ARTIFACT_DATABASE, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(ARTIFACT_STORE)) {
+        request.result.createObjectStore(ARTIFACT_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(request.error ?? new Error("로컬 논문 저장소를 열지 못했습니다."));
+  });
+}
+
+export async function saveProjectPdf(
+  documentId: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  if (runningInTauri()) {
+    await invoke("write_project_pdf", {
+      documentId,
+      bytes: Array.from(bytes),
+    });
+    return;
+  }
+  const database = await openArtifactDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(ARTIFACT_STORE, "readwrite");
+    transaction.objectStore(ARTIFACT_STORE).put(bytes.slice().buffer, documentId);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () =>
+      reject(transaction.error ?? new Error("한국어 논문을 저장하지 못했습니다."));
+  });
+  database.close();
+}
+
+export async function readProjectPdf(
+  documentId: string,
+): Promise<Uint8Array | null> {
+  if (runningInTauri()) {
+    const response = await invoke<BinaryResponse>("read_project_pdf", {
+      documentId,
+    });
+    const bytes =
+      response instanceof Uint8Array
+        ? response
+        : response instanceof ArrayBuffer
+          ? new Uint8Array(response)
+          : new Uint8Array(response);
+    return bytes.byteLength ? bytes : null;
+  }
+  const database = await openArtifactDatabase();
+  const value = await new Promise<ArrayBuffer | undefined>((resolve, reject) => {
+    const transaction = database.transaction(ARTIFACT_STORE, "readonly");
+    const request = transaction.objectStore(ARTIFACT_STORE).get(documentId);
+    request.onsuccess = () => resolve(request.result as ArrayBuffer | undefined);
+    request.onerror = () =>
+      reject(request.error ?? new Error("저장된 한국어 논문을 읽지 못했습니다."));
+  });
+  database.close();
+  return value ? new Uint8Array(value) : null;
+}
+
 export async function selectPdfPath(): Promise<string | null> {
   if (!runningInTauri()) return null;
   const { open } = await import("@tauri-apps/plugin-dialog");
@@ -25,17 +100,6 @@ export async function selectPdfPath(): Promise<string | null> {
     multiple: false,
     directory: false,
     filters: [{ name: "PDF document", extensions: ["pdf"] }],
-  });
-  return typeof selected === "string" ? selected : null;
-}
-
-export async function selectLibraryPath(): Promise<string | null> {
-  if (!runningInTauri()) return null;
-  const { open } = await import("@tauri-apps/plugin-dialog");
-  const selected = await open({
-    multiple: false,
-    directory: true,
-    title: "논문 폴더 선택",
   });
   return typeof selected === "string" ? selected : null;
 }
@@ -84,26 +148,9 @@ export async function readProviderSecret(
   return (await invoke<string | null>("read_provider_secret", { profileId })) ?? "";
 }
 
-export async function scanLibraryFolder(
-  folderPath: string,
-): Promise<ScannedPdfFile[]> {
-  if (!runningInTauri()) {
-    throw new Error("폴더 스캔은 데스크톱 앱에서 사용할 수 있습니다.");
-  }
-  return invoke<ScannedPdfFile[]>("scan_pdf_directory", {
-    path: folderPath,
-  });
-}
-
 export function fileNameFromPath(filePath: string): string {
   const segments = filePath.split(/[\\/]/);
   return segments.at(-1) || "Untitled.pdf";
-}
-
-export function folderNameFromPath(folderPath: string): string {
-  const normalized = folderPath.replace(/[\\/]+$/, "");
-  const segments = normalized.split(/[\\/]/);
-  return segments.at(-1) || normalized;
 }
 
 export function stableDocumentId(filePath: string): string {

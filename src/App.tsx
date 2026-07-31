@@ -1,1153 +1,483 @@
 import {
-  lazy,
-  Suspense,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import type { PDFDocumentProxy } from "pdfjs-dist";
 import {
   AlertCircle,
   Bookmark,
+  Download,
   FileWarning,
-  Languages,
   LoaderCircle,
   MessageSquareText,
+  Pencil,
+  RefreshCw,
   StickyNote,
   X,
 } from "lucide-react";
 import { EmptyReader } from "./components/EmptyReader";
 import { FigurePreview } from "./components/FigurePreview";
+import { KoreanPaperEmpty } from "./components/KoreanPaperEmpty";
+import { KoreanPaperEditor } from "./components/KoreanPaperEditor";
 import { PdfPane } from "./components/PdfPane";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { Sidebar } from "./components/Sidebar";
-import {
-  ToolRail,
-  type TranslationScopeRequest,
-} from "./components/ToolRail";
+import { ToolRail } from "./components/ToolRail";
 import { TopBar } from "./components/TopBar";
+import { useDictionaryLookup } from "./hooks/useDictionaryLookup";
+import { useDocumentSession } from "./hooks/useDocumentSession";
+import { useKoreanPaperCreation } from "./hooks/useKoreanPaperCreation";
+import { useModelSettings } from "./hooks/useModelSettings";
+import { usePaperAsk } from "./hooks/usePaperAsk";
+import { resolveDocumentReferences } from "./lib/document-references";
 import {
-  extractDocumentBlocks,
-  resolveDocumentReferences,
-} from "./lib/document-blocks";
-import {
-  activeModelProfile,
-  completeChat,
-  dictionaryMessages,
-  makeTranslationRecord,
-  modelConnectionSignature,
-  parseDictionaryResponse,
-  parseTranslationResponse,
-  questionMessages,
-  translationMessages,
-} from "./lib/llm";
-import { extractPdfTitle, loadPdfDocument } from "./lib/pdf";
-import {
-  fileNameFromPath,
-  folderNameFromPath,
-  readPdfFromPath,
-  runningInTauri,
-  scanLibraryFolder,
-  selectLibraryPath,
-  selectPdfPath,
-  stableDocumentId,
-} from "./lib/platform";
-import {
-  createRetypesetProject,
-} from "./lib/semantic-paper";
-import {
-  DEFAULT_VIEW_STATE,
-  mergeViewState,
-  normalizeAnchor,
-  normalizeRotation,
-  scaleBy,
-} from "./lib/reader-state";
-import {
-  deleteHighlight,
-  deleteNote,
-  findDictionaryEntry,
-  findDocument,
-  listChatSessions,
-  listDocumentBlocks,
-  listHighlights,
-  listLibraryDocuments,
-  listLibraryFolders,
-  listNotes,
-  listTranslations,
-  loadRetypesetProject,
-  loadLlmSettings,
-  makeReaderDocument,
-  saveChatSession,
-  saveDictionaryEntry,
-  saveDocument,
-  saveDocumentBlocks,
-  saveHighlight,
-  saveLibraryScan,
-  saveLlmSettings,
-  saveNote,
-  saveTranslationJob,
-  saveTranslations,
-  saveRetypesetProject,
-  setDocumentTags,
-  updateReadingState,
-} from "./lib/storage";
+  attachReferencePreviewTargets,
+  buildCompanionReferences,
+  nextReferencePreviewHoverState,
+  referencePreviewCaption,
+  translatedReferenceCaption,
+  type ReferencePreviewHoverEvent,
+  type ReferencePreviewPane,
+} from "./lib/reference-preview";
+import { observeClearedTextSelection } from "./lib/selection-toolbar";
+import { analyzeSemanticPaper } from "./lib/semantic-paper";
 import type {
-  ChatMessage,
-  ChatSession,
-  DictionaryEntry,
-  DocumentBlock,
   DocumentReference,
-  Highlight,
-  LibraryFolder,
   LlmSettings,
-  NormalizedRect,
-  Note,
+  LlmUsageByPhase,
   PaneId,
-  ReaderDocument,
+  ReferenceAnchor,
   ReadingToolTab,
-  RetypesetProject,
-  SplitMode,
   TextSelection,
-  TranslationJob,
-  TranslationRecord,
-  ViewState,
 } from "./types";
 
-type PaneStates = Record<PaneId, ViewState>;
-
-const RetypesetReviewDialog = lazy(() =>
-  import("./components/RetypesetReviewDialog").then((module) => ({
-    default: module.RetypesetReviewDialog,
-  })),
-);
-
-const INITIAL_PANE_STATES: PaneStates = {
-  original: DEFAULT_VIEW_STATE,
-  companion: DEFAULT_VIEW_STATE,
-};
-
-function createId(prefix: string): string {
-  const random =
-    globalThis.crypto?.randomUUID?.() ??
-    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  return `${prefix}-${random}`;
-}
-
-function unionRects(rects: NormalizedRect[]): NormalizedRect {
-  const minX = Math.min(...rects.map((rect) => rect.x));
-  const minY = Math.min(...rects.map((rect) => rect.y));
-  const maxX = Math.max(...rects.map((rect) => rect.x + rect.width));
-  const maxY = Math.max(...rects.map((rect) => rect.y + rect.height));
-  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
-}
-
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+function tokenUsageLabel(usage: LlmUsageByPhase): string {
+  const suffix = usage.total.estimated ? " · 추정" : "";
+  return `구조 ${usage.structure.totalTokens.toLocaleString()} · 번역 ${usage.translation.totalTokens.toLocaleString()} · 합계 ${usage.total.totalTokens.toLocaleString()} 토큰${suffix}`;
 }
 
 function App() {
-  const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null);
-  const [readerDocument, setReaderDocument] = useState<ReaderDocument | null>(
-    null,
-  );
-  const [paneStates, setPaneStates] =
-    useState<PaneStates>(INITIAL_PANE_STATES);
   const [activePane, setActivePane] = useState<PaneId>("original");
-  const [splitMode, setSplitMode] =
-    useState<SplitMode>("side-by-side");
-  const [syncEnabled, setSyncEnabled] = useState(true);
-  const [documents, setDocuments] = useState<ReaderDocument[]>([]);
-  const [folders, setFolders] = useState<LibraryFolder[]>([]);
-  const [blocks, setBlocks] = useState<DocumentBlock[]>([]);
-  const [translations, setTranslations] = useState<TranslationRecord[]>([]);
-  const [highlights, setHighlights] = useState<Highlight[]>([]);
-  const [notes, setNotes] = useState<Note[]>([]);
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [expandedPane, setExpandedPane] = useState<PaneId | null>(null);
   const [settings, setSettings] = useState<LlmSettings | null>(null);
   const [selection, setSelection] = useState<TextSelection | null>(null);
-  const [translationJob, setTranslationJob] =
-    useState<TranslationJob | null>(null);
-  const [dictionaryEntry, setDictionaryEntry] =
-    useState<DictionaryEntry | null>(null);
-  const [selectedReference, setSelectedReference] =
-    useState<DocumentReference | null>(null);
-  const [toolTab, setToolTab] = useState<ReadingToolTab>("translation");
-  const [loading, setLoading] = useState(false);
-  const [scanning, setScanning] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analysisProgress, setAnalysisProgress] = useState(0);
-  const [dictionaryLoading, setDictionaryLoading] = useState(false);
-  const [asking, setAsking] = useState(false);
-  const [streamingAnswer, setStreamingAnswer] = useState("");
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [retypesetOpen, setRetypesetOpen] = useState(false);
-  const [retypesetProject, setRetypesetProject] =
-    useState<RetypesetProject | null>(null);
-  const [settingsTesting, setSettingsTesting] = useState(false);
-  const [translationOverlay] = useState(true);
+  const [selectedReference, setSelectedReference] = useState<{
+    reference: DocumentReference;
+    anchor: ReferenceAnchor;
+    pane: ReferencePreviewPane;
+    pinned: boolean;
+  } | null>(null);
+  const [toolTab, setToolTab] = useState<ReadingToolTab>("ask");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const browserInputRef = useRef<HTMLInputElement>(null);
-  const currentPdfRef = useRef<PDFDocumentProxy | null>(null);
-  const currentPdfBytesRef = useRef<Uint8Array | null>(null);
-  const currentDocumentIdRef = useRef<string | null>(null);
-  const saveTimerRef = useRef<number | null>(null);
-  const cancelTranslationRef = useRef(false);
-  const translationRunRef = useRef(0);
-  const dictionaryRunRef = useRef(0);
-  const questionRunRef = useRef(0);
 
-  const activeState = paneStates[activePane];
-  const pageCount = pdfDocument?.numPages ?? 0;
-  const references = useMemo(
+  const browserInputRef = useRef<HTMLInputElement>(null);
+  const referenceCloseTimerRef = useRef<number | null>(null);
+  const referenceHoverStateRef = useRef({
+    token: false,
+    card: false,
+    pinned: false,
+    open: false,
+  });
+  const requestBrowserFile = useCallback(
+    () => browserInputRef.current?.click(),
+    [],
+  );
+  const {
+    pdfDocument,
+    readerDocument,
+    documents,
+    blocks,
+    highlights,
+    notes,
+    hydration,
+    paneStates,
+    loading,
+    analyzing,
+    analysisProgress,
+    getActiveDocumentId,
+    getSourceBytes,
+    openPdf,
+    openBrowserFile,
+    openLibraryDocument,
+    prepareCompanion,
+    updatePane,
+    updateDocument,
+    addHighlight: addSessionHighlight,
+    addNote: addSessionNote,
+    updateNote,
+    removeNote,
+    removeHighlight,
+  } = useDocumentSession({
+    settings,
+    onSettingsChange: setSettings,
+    requestBrowserFile,
+    onError: setError,
+    onNotice: setNotice,
+  });
+  const {
+    entry: dictionaryEntry,
+    loading: dictionaryLoading,
+    lookup: lookupWord,
+    close: closeDictionary,
+  } = useDictionaryLookup({
+    document: readerDocument,
+    settings,
+    getActiveDocumentId,
+    onError: setError,
+  });
+
+  const resolvedReferences = useMemo(
     () => resolveDocumentReferences(blocks),
     [blocks],
   );
-
-  const refreshLibrary = useCallback(async () => {
-    try {
-      const [nextDocuments, nextFolders] = await Promise.all([
-        listLibraryDocuments(),
-        listLibraryFolders(),
-      ]);
-      setDocuments(nextDocuments);
-      setFolders(nextFolders);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  }, []);
-
-  const hydrateDocumentData = useCallback(async (documentId: string) => {
-    const [
-      savedBlocks,
-      savedTranslations,
-      savedHighlights,
-      savedNotes,
-      savedSessions,
-    ] = await Promise.all([
-      listDocumentBlocks(documentId),
-      listTranslations(documentId),
-      listHighlights(documentId),
-      listNotes(documentId),
-      listChatSessions(documentId),
-    ]);
-    if (currentDocumentIdRef.current !== documentId) return [];
-    setBlocks(savedBlocks);
-    setTranslations(savedTranslations);
-    setHighlights(savedHighlights);
-    setNotes(savedNotes);
-    setSessions(savedSessions);
-    return savedBlocks;
-  }, []);
-
-  const analyzeDocument = useCallback(
-    async (document: PDFDocumentProxy, documentId: string) => {
-      setAnalyzing(true);
-      setAnalysisProgress(0);
-      try {
-        const extracted = await extractDocumentBlocks(
-          document,
-          documentId,
-          (pageNumber, count) => {
-            if (currentDocumentIdRef.current === documentId) {
-              setAnalysisProgress(pageNumber / count);
-            }
-          },
-        );
-        await saveDocumentBlocks(documentId, extracted);
-        if (currentDocumentIdRef.current === documentId) {
-          setBlocks(extracted);
-          if (!extracted.length) {
-            setNotice(
-              "텍스트를 찾지 못했습니다. 스캔 PDF에서는 번역과 선택 도구를 사용할 수 없습니다.",
-            );
-          }
-        }
-      } catch (cause) {
-        if (currentDocumentIdRef.current === documentId) {
-          setError(
-            cause instanceof Error
-              ? cause.message
-              : "텍스트 블록을 분석하지 못했습니다.",
-          );
-        }
-      } finally {
-        if (currentDocumentIdRef.current === documentId) setAnalyzing(false);
-      }
-    },
-    [],
+  const semanticPaper = useMemo(
+    () => analyzeSemanticPaper(blocks, resolvedReferences),
+    [blocks, resolvedReferences],
   );
-
-  useEffect(() => {
-    void refreshLibrary();
-    void loadLlmSettings()
-      .then(setSettings)
-      .catch((cause: unknown) => {
-        setError(cause instanceof Error ? cause.message : String(cause));
-      });
-    return () => {
-      if (saveTimerRef.current !== null) {
-        window.clearTimeout(saveTimerRef.current);
-      }
-      void currentPdfRef.current?.cleanup();
-    };
-  }, [refreshLibrary]);
-
-  useEffect(() => {
-    if (!readerDocument) return;
-    if (saveTimerRef.current !== null) {
-      window.clearTimeout(saveTimerRef.current);
-    }
-    saveTimerRef.current = window.setTimeout(() => {
-      void updateReadingState(
-        readerDocument.id,
-        paneStates.original,
-        splitMode,
-        syncEnabled,
-      ).then(refreshLibrary);
-    }, 450);
-    return () => {
-      if (saveTimerRef.current !== null) {
-        window.clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
-    };
-  }, [
-    paneStates.original,
-    readerDocument,
-    refreshLibrary,
-    splitMode,
-    syncEnabled,
-  ]);
-
-  const installDocument = useCallback(
-    async (bytes: Uint8Array, filePath: string) => {
-      setLoading(true);
-      setError(null);
-      setNotice(null);
-      setSelection(null);
-      setDictionaryEntry(null);
-      setRetypesetOpen(false);
-      setRetypesetProject(null);
-      cancelTranslationRef.current = true;
-      translationRunRef.current += 1;
-      dictionaryRunRef.current += 1;
-      questionRunRef.current += 1;
-      try {
-        const id = stableDocumentId(filePath);
-        // PDF.js transfers its input buffer to the worker. Keep an independent
-        // source copy for semantic reconstruction and export.
-        const sourceBytes = new Uint8Array(bytes);
-        const [document, previous] = await Promise.all([
-          loadPdfDocument(new Uint8Array(sourceBytes)),
-          findDocument(id),
-        ]);
-        currentDocumentIdRef.current = id;
-        setAnalyzing(false);
-        setAnalysisProgress(0);
-        setTranslationJob(null);
-        setDictionaryLoading(false);
-        setAsking(false);
-        setStreamingAnswer("");
-        const fallback = fileNameFromPath(filePath);
-        const title = await extractPdfTitle(document, fallback);
-        const nextReaderDocument = makeReaderDocument(
-          id,
-          filePath,
-          title,
-          document.numPages,
-          previous,
-        );
-        const restored = mergeViewState(
-          DEFAULT_VIEW_STATE,
-          previous?.viewState ?? DEFAULT_VIEW_STATE,
-          document.numPages,
-        );
-
-        const oldDocument = currentPdfRef.current;
-        currentPdfRef.current = document;
-        currentPdfBytesRef.current = sourceBytes;
-        setPdfDocument(document);
-        setReaderDocument(nextReaderDocument);
-        setPaneStates({ original: restored, companion: restored });
-        setSplitMode(nextReaderDocument.splitMode);
-        setSyncEnabled(nextReaderDocument.syncEnabled);
-        setActivePane("original");
-        setBlocks([]);
-        setTranslations([]);
-        setHighlights([]);
-        setNotes([]);
-        setSessions([]);
-        await saveDocument(nextReaderDocument);
-        const savedBlocks = await hydrateDocumentData(id);
-        const needsAnalysis =
-          !savedBlocks.length ||
-          savedBlocks.some((block) => !block.id.includes("-v5-b"));
-        if (needsAnalysis && nextReaderDocument.translationProgress) {
-          const resetDocument = {
-            ...nextReaderDocument,
-            translationProgress: 0,
-          };
-          setReaderDocument(resetDocument);
-          await saveDocument(resetDocument);
-        }
-        await refreshLibrary();
-        if (needsAnalysis) {
-          void analyzeDocument(document, id);
-        }
-        if (oldDocument) void oldDocument.cleanup();
-      } catch (cause) {
-        const message = cause instanceof Error ? cause.message : String(cause);
-        setError(message || "PDF를 열지 못했습니다.");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [analyzeDocument, hydrateDocumentData, refreshLibrary],
+  const references = useMemo(
+    () =>
+      attachReferencePreviewTargets(
+        blocks,
+        resolvedReferences,
+        semanticPaper.assets,
+      ),
+    [blocks, resolvedReferences, semanticPaper.assets],
   );
-
-  const openPdf = useCallback(async () => {
-    setError(null);
-    if (!runningInTauri()) {
-      browserInputRef.current?.click();
-      return;
-    }
-    try {
-      const path = await selectPdfPath();
-      if (!path) return;
-      await installDocument(await readPdfFromPath(path), path);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  }, [installDocument]);
-
-  const openBrowserFile = useCallback(
-    async (file: File | undefined) => {
-      if (!file) return;
-      if (
-        file.type !== "application/pdf" &&
-        !file.name.toLowerCase().endsWith(".pdf")
-      ) {
-        setError("PDF 파일만 열 수 있습니다.");
-        return;
-      }
-      await installDocument(
-        new Uint8Array(await file.arrayBuffer()),
-        `browser://${file.name}`,
-      );
-    },
-    [installDocument],
-  );
-
-  const openLibraryDocument = useCallback(
-    async (document: ReaderDocument) => {
-      if (document.missing) {
-        setError("파일이 이동되거나 삭제되었습니다. 폴더를 다시 스캔해 주세요.");
-        return;
-      }
-      if (document.filePath.startsWith("browser://")) {
-        setError("브라우저에서 연 파일은 다시 선택해 주세요.");
-        browserInputRef.current?.click();
-        return;
-      }
-      setLoading(true);
-      setError(null);
-      try {
-        await installDocument(
-          await readPdfFromPath(document.filePath),
-          document.filePath,
-        );
-      } catch (cause) {
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "파일을 다시 열지 못했습니다.",
-        );
-        setLoading(false);
-      }
-    },
-    [installDocument],
-  );
-
-  const rescanFolder = useCallback(
-    async (folder: LibraryFolder) => {
-      setScanning(true);
-      setError(null);
-      try {
-        const files = await scanLibraryFolder(folder.path);
-        const nextFolder = {
-          ...folder,
-          lastScannedAt: new Date().toISOString(),
-        };
-        await saveLibraryScan(nextFolder, files);
-        await refreshLibrary();
-        setNotice(`${folder.name}에서 PDF ${files.length}개를 찾았습니다.`);
-      } catch (cause) {
-        setError(cause instanceof Error ? cause.message : String(cause));
-      } finally {
-        setScanning(false);
-      }
-    },
-    [refreshLibrary],
-  );
-
-  const addLibraryFolder = useCallback(async () => {
-    if (!runningInTauri()) {
-      setError("폴더 라이브러리는 데스크톱 앱에서 사용할 수 있습니다.");
-      return;
-    }
-    const path = await selectLibraryPath();
-    if (!path) return;
-    const folder: LibraryFolder = {
-      id: stableDocumentId(`folder:${path}`),
-      path,
-      name: folderNameFromPath(path),
-      lastScannedAt: new Date().toISOString(),
-    };
-    await rescanFolder(folder);
-  }, [rescanFolder]);
-
-  const updateTags = useCallback(
-    async (documentId: string, tags: string[]) => {
-      await setDocumentTags(documentId, tags);
-      setDocuments((current) =>
-        current.map((document) =>
-          document.id === documentId ? { ...document, tags } : document,
-        ),
-      );
-      setReaderDocument((current) =>
-        current?.id === documentId ? { ...current, tags } : current,
-      );
-    },
-    [],
-  );
-
-  const updatePane = useCallback(
-    (paneId: PaneId, update: Partial<ViewState>) => {
-      if (!pageCount) return;
-      setPaneStates((current) => {
-        const next = mergeViewState(current[paneId], update, pageCount);
-        if (syncEnabled) return { original: next, companion: next };
-        return { ...current, [paneId]: next };
-      });
-    },
-    [pageCount, syncEnabled],
-  );
-
-  const updateFromToolbar = useCallback(
-    (update: Partial<ViewState>) => {
-      if (!pageCount) return;
-      setPaneStates((current) => {
-        const next = mergeViewState(current[activePane], update, pageCount);
-        if (syncEnabled) return { original: next, companion: next };
-        return { ...current, [activePane]: next };
-      });
-    },
-    [activePane, pageCount, syncEnabled],
-  );
-
-  const setPage = useCallback(
-    (pageNumber: number) => {
-      const anchor = normalizeAnchor(
-        { pageNumber, relativeOffsetY: 0 },
-        pageCount,
-      );
-      updateFromToolbar(anchor);
-    },
-    [pageCount, updateFromToolbar],
-  );
-
-  const setZoom = useCallback(
-    (direction: "in" | "out") => {
-      const scale = scaleBy(activeState.scale, direction);
-      updateFromToolbar({ scale, scaleValue: String(scale) });
-    },
-    [activeState.scale, updateFromToolbar],
-  );
-
-  const rotate = useCallback(() => {
-    updateFromToolbar({
-      rotation: normalizeRotation(activeState.rotation + 90),
-    });
-  }, [activeState.rotation, updateFromToolbar]);
-
-  const toggleSync = useCallback(() => {
-    setSyncEnabled((enabled) => {
-      if (!enabled) {
-        setPaneStates((current) => ({
-          original: current[activePane],
-          companion: current[activePane],
-        }));
-      }
-      return !enabled;
-    });
-  }, [activePane]);
-
-  const changeSplitMode = useCallback((mode: SplitMode) => {
-    setSplitMode(mode);
-    if (mode === "single") setActivePane("original");
-  }, []);
-
-  const startTranslation = useCallback(
-    async (scope: TranslationScopeRequest) => {
-      if (!readerDocument || !settings) return;
-      if (!blocks.length) {
-        setError("텍스트 분석이 끝난 뒤 번역할 수 있습니다.");
-        return;
-      }
-      const documentId = readerDocument.id;
-      const runId = translationRunRef.current + 1;
-      translationRunRef.current = runId;
-      cancelTranslationRef.current = false;
-      const ownsActiveDocument = () =>
-        translationRunRef.current === runId &&
-        currentDocumentIdRef.current === documentId;
-      setError(null);
-      setToolTab("translation");
-      let availableBlocks = blocks.filter((block) => block.translatable);
-      if (scope.kind === "page") {
-        availableBlocks = availableBlocks.filter(
-          (block) => block.pageNumber === scope.pageNumber,
-        );
-      } else if (scope.kind === "range") {
-        const start = Math.max(1, Math.min(scope.startPage, scope.endPage));
-        const end = Math.min(pageCount, Math.max(scope.startPage, scope.endPage));
-        availableBlocks = availableBlocks.filter(
-          (block) => block.pageNumber >= start && block.pageNumber <= end,
-        );
-      } else if (scope.kind === "selection") {
-        if (!selection) {
-          setError("먼저 번역할 텍스트를 선택해 주세요.");
-          return;
-        }
-        const selectionBlock: DocumentBlock = {
-          id: `${readerDocument.id}-selection-${stableDocumentId(selection.text)}`,
-          documentId: readerDocument.id,
-          pageNumber: selection.pageNumber,
-          type: "paragraph",
-          text: selection.text,
-          bbox: unionRects(selection.rects),
-          readingOrder: 100000,
-          translatable: true,
-        };
-        availableBlocks = [selectionBlock];
-        if (!blocks.some((block) => block.id === selectionBlock.id)) {
-          const nextBlocks = [...blocks, selectionBlock];
-          setBlocks(nextBlocks);
-          await saveDocumentBlocks(readerDocument.id, nextBlocks);
-          if (!ownsActiveDocument()) return;
-        }
-      } else if (scope.kind === "failed") {
-        const failedIds = new Set(
-          translations
-            .filter((translation) => translation.status === "failed")
-            .map((translation) => translation.blockId),
-        );
-        availableBlocks = availableBlocks.filter((block) =>
-          failedIds.has(block.id),
-        );
-      }
-
-      const cached = new Map(
-        translations
-          .filter(
-            (translation) =>
-              translation.targetLanguage === settings.targetLanguage &&
-              translation.status === "translated",
+  const {
+    document: koreanDocument,
+    blocks: koreanBlocks,
+    translations,
+    project: retypesetProject,
+    build: koreanBuild,
+    editing: editingKorean,
+    setEditing: setEditingKorean,
+    replaceProject: setRetypesetProject,
+    buildPaper: buildKoreanPaper,
+    applyEdits: applyKoreanEdits,
+    exportPaper: exportKoreanPaper,
+  } = useKoreanPaperCreation({
+    document: readerDocument,
+    settings,
+    sourceBlocks: blocks,
+    paper: semanticPaper,
+    references,
+    hydration,
+    getSourceBytes,
+    getActiveDocumentId,
+    onSettingsChange: setSettings,
+    onDocumentChange: updateDocument,
+    onCompanionReady: prepareCompanion,
+    onError: setError,
+    onNotice: setNotice,
+  });
+  const {
+    activeProfile,
+    models: paperModels,
+    activeModelId,
+    effortOptions,
+    open: settingsOpen,
+    testing: settingsTesting,
+    setOpen: setSettingsOpen,
+    selectModel: selectPaperModel,
+    selectEffort: selectReasoningEffort,
+    save: saveSettings,
+    test: testSettings,
+  } = useModelSettings({
+    settings,
+    onSettingsChange: setSettings,
+    document: readerDocument,
+    onDocumentChange: updateDocument,
+    project: retypesetProject,
+    onProjectChange: setRetypesetProject,
+    onError: setError,
+    onNotice: setNotice,
+  });
+  const structuredBlocks =
+    retypesetProject?.documentStructure?.blocks ?? [];
+  const storedStructuredReferences =
+    retypesetProject?.documentStructure?.references;
+  const structuredResolvedReferences = useMemo(
+    () =>
+      structuredBlocks.length
+        ? resolveDocumentReferences(
+            structuredBlocks,
+            storedStructuredReferences,
           )
-          .map((translation) => [translation.blockId, translation]),
-      );
-      const targetBlocks =
-        scope.kind === "failed"
-          ? availableBlocks
-          : availableBlocks.filter(
-              (block) =>
-                cached.get(block.id)?.sourceText !== block.text,
-            );
-      if (!targetBlocks.length) {
-        setNotice("선택한 범위는 이미 번역되어 있습니다.");
-        return;
-      }
-
-      const now = new Date().toISOString();
-      let job: TranslationJob = {
-        id: createId("translation"),
-        documentId: readerDocument.id,
-        status: "running",
-        totalBlocks: targetBlocks.length,
-        completedBlocks: 0,
-        failedBlockIds: [],
-        startedAt: now,
-        updatedAt: now,
-      };
-      setTranslationJob(job);
-      await saveTranslationJob(job);
-      const collected = new Map(translations.map((item) => [item.id, item]));
-
-      for (let index = 0; index < targetBlocks.length; index += 6) {
-        if (cancelTranslationRef.current || !ownsActiveDocument()) break;
-        const batch = targetBlocks.slice(index, index + 6);
-        try {
-          const response = await completeChat(
-            settings,
-            translationMessages(
-              settings.targetLanguage,
-              batch.map((block) => ({
-                id: block.id,
-                type: block.type,
-                text: block.text,
-              })),
-              settings.instructions,
-            ),
-          );
-          const parsed = parseTranslationResponse(
-            response,
-            batch.map((block) => block.id),
-          );
-          const records = parsed.map((result) => {
-            const block = batch.find(
-              (candidate) => candidate.id === result.blockId,
-            )!;
-            return makeTranslationRecord(
-              readerDocument.id,
-              block.id,
-              block.text,
-              result.text,
-              settings.targetLanguage,
-            );
-          });
-          await saveTranslations(records);
-          for (const record of records) collected.set(record.id, record);
-          job = {
-            ...job,
-            completedBlocks: job.completedBlocks + batch.length,
-            updatedAt: new Date().toISOString(),
-          };
-        } catch (cause) {
-          const message =
-            cause instanceof Error ? cause.message : "번역 요청 실패";
-          const failed = batch.map<TranslationRecord>((block) => ({
-            id: `${block.id}:${settings.targetLanguage}`,
-            documentId: readerDocument.id,
-            blockId: block.id,
-            targetLanguage: settings.targetLanguage,
-            sourceText: block.text,
-            translatedText: "",
-            status: "failed",
-            error: message,
-            updatedAt: new Date().toISOString(),
-          }));
-          await saveTranslations(failed);
-          for (const record of failed) collected.set(record.id, record);
-          job = {
-            ...job,
-            completedBlocks: job.completedBlocks + batch.length,
-            failedBlockIds: [
-              ...job.failedBlockIds,
-              ...batch.map((block) => block.id),
-            ],
-            updatedAt: new Date().toISOString(),
-          };
-        }
-        if (ownsActiveDocument()) {
-          setTranslations([...collected.values()]);
-          setTranslationJob(job);
-        }
-        await saveTranslationJob(job);
-      }
-
-      const interrupted =
-        cancelTranslationRef.current || !ownsActiveDocument();
-      const finalJob: TranslationJob = {
-        ...job,
-        status: interrupted
-          ? "cancelled"
-          : job.failedBlockIds.length === job.totalBlocks
-            ? "failed"
-            : "completed",
-        updatedAt: new Date().toISOString(),
-      };
-      await saveTranslationJob(finalJob);
-      if (!ownsActiveDocument()) return;
-      setTranslationJob(finalJob);
-      const translatedIds = new Set(
-        [...collected.values()]
-          .filter((item) => item.status === "translated")
-          .map((item) => item.blockId),
-      );
-      const translatableCount = Math.max(
-        1,
-        blocks.filter((block) => block.translatable).length,
-      );
-      const nextDocument = {
-        ...readerDocument,
-        translationProgress: Math.min(
-          1,
-          translatedIds.size / translatableCount,
-        ),
-      };
-      setReaderDocument(nextDocument);
-      await saveDocument(nextDocument);
-      await refreshLibrary();
-    },
+        : resolvedReferences,
     [
-      blocks,
-      pageCount,
-      readerDocument,
-      refreshLibrary,
-      selection,
-      settings,
-      translations,
+      resolvedReferences,
+      storedStructuredReferences,
+      structuredBlocks,
     ],
   );
+  const structuredPaper = useMemo(
+    () =>
+      structuredBlocks.length
+        ? analyzeSemanticPaper(
+            structuredBlocks,
+            structuredResolvedReferences,
+          )
+        : semanticPaper,
+    [semanticPaper, structuredBlocks, structuredResolvedReferences],
+  );
+  const structuredReferences = useMemo(
+    () =>
+      structuredBlocks.length
+        ? attachReferencePreviewTargets(
+            structuredBlocks,
+            structuredResolvedReferences,
+            structuredPaper.assets,
+          )
+        : references,
+    [
+      references,
+      structuredBlocks,
+      structuredPaper.assets,
+      structuredResolvedReferences,
+    ],
+  );
+  const sourcePreviewReferences = useMemo(
+    () =>
+      structuredBlocks.length
+        ? structuredReferences
+        : references,
+    [references, structuredBlocks.length, structuredReferences],
+  );
+  const koreanReferences = useMemo(
+    () =>
+      buildCompanionReferences(
+        koreanBlocks,
+        structuredReferences,
+      ),
+    [koreanBlocks, structuredReferences],
+  );
+  const selectedPreviewCaption = useMemo(() => {
+    if (!selectedReference) return undefined;
+    const { pane, reference } = selectedReference;
+    const previewBlocks =
+      pane === "source" && !structuredBlocks.length
+        ? blocks
+        : structuredBlocks;
+    const sourceCaption = previewBlocks.find(
+      (block) => block.id === reference.targetBlockId,
+    )?.text;
+    const translatedCaption = translatedReferenceCaption(
+      reference,
+      structuredBlocks,
+      translations,
+      structuredPaper.translatableBlockIds,
+    );
+    return referencePreviewCaption(
+      pane,
+      sourceCaption,
+      translatedCaption,
+    );
+  }, [
+    blocks,
+    selectedReference,
+    structuredBlocks,
+    structuredPaper.translatableBlockIds,
+    translations,
+  ]);
+  const activateAsk = useCallback(() => setToolTab("ask"), []);
+  const {
+    sessions,
+    asking,
+    streamingAnswer,
+    ask: askQuestion,
+  } = usePaperAsk({
+    document: readerDocument,
+    settings,
+    pageCount: pdfDocument?.numPages ?? 0,
+    blocks,
+    paper: semanticPaper,
+    selection,
+    project: retypesetProject,
+    hydration,
+    getPdfBytes: getSourceBytes,
+    getActiveDocumentId,
+    onProjectChange: setRetypesetProject,
+    onError: setError,
+    onActivate: activateAsk,
+  });
 
-  const editTranslation = useCallback(
-    async (translation: TranslationRecord, text: string) => {
-      const next = {
-        ...translation,
-        translatedText: text.trim(),
-        status: "translated" as const,
-        error: undefined,
-        manuallyEdited: true,
-        locked: true,
-        updatedAt: new Date().toISOString(),
-      };
-      setTranslations((current) =>
-        current.map((candidate) =>
-          candidate.id === next.id ? next : candidate,
-        ),
-      );
-      await saveTranslations([next]);
-    },
+  useEffect(() => {
+    return () => {
+      if (referenceCloseTimerRef.current !== null) {
+        window.clearTimeout(referenceCloseTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(
+    () =>
+      observeClearedTextSelection(
+        document,
+        () => window.getSelection(),
+        () => setSelection(null),
+      ),
     [],
   );
 
-  const lookupWord = useCallback(
-    async (nextSelection: TextSelection) => {
-      if (!readerDocument || !settings) return;
-      const word = nextSelection.text.trim();
-      if (!/^[A-Za-z][A-Za-z'-]*$/.test(word)) return;
-      const documentId = readerDocument.id;
-      const runId = dictionaryRunRef.current + 1;
-      dictionaryRunRef.current = runId;
-      const ownsActiveDocument = () =>
-        dictionaryRunRef.current === runId &&
-        currentDocumentIdRef.current === documentId;
-      setSelection(nextSelection);
-      setDictionaryLoading(true);
-      setDictionaryEntry(null);
-      setError(null);
-      try {
-        const cached = await findDictionaryEntry(
-          readerDocument.id,
-          word,
-          nextSelection.context,
-        );
-        if (cached) {
-          if (ownsActiveDocument()) setDictionaryEntry(cached);
-          return;
-        }
-        const response = await completeChat(
-          settings,
-          dictionaryMessages(
-            word,
-            nextSelection.context,
-            settings.targetLanguage,
-          ),
-        );
-        const parsed = parseDictionaryResponse(response);
-        const entry: DictionaryEntry = {
-          id: createId("dictionary"),
-          documentId: readerDocument.id,
-          word,
-          context: nextSelection.context,
-          ...parsed,
-          createdAt: new Date().toISOString(),
-        };
-        await saveDictionaryEntry(entry);
-        if (ownsActiveDocument()) setDictionaryEntry(entry);
-      } catch (cause) {
-        if (ownsActiveDocument()) {
-          setError(cause instanceof Error ? cause.message : String(cause));
-        }
-      } finally {
-        if (ownsActiveDocument()) setDictionaryLoading(false);
-      }
-    },
-    [readerDocument, settings],
-  );
+  useEffect(() => {
+    setSelection(null);
+    setSelectedReference(null);
+    referenceHoverStateRef.current = {
+      token: false,
+      card: false,
+      pinned: false,
+      open: false,
+    };
+    setActivePane("original");
+    setExpandedPane(null);
+  }, [readerDocument?.id]);
 
   const addHighlightFromSelection = useCallback(
     async (color: string) => {
-      if (!readerDocument || !selection) return;
-      const highlight: Highlight = {
-        id: createId("highlight"),
-        documentId: readerDocument.id,
-        pageNumber: selection.pageNumber,
-        source: selection.source,
-        selectedText: selection.text,
-        rects: selection.rects,
-        color,
-        createdAt: new Date().toISOString(),
-      };
-      await saveHighlight(highlight);
-      setHighlights((current) => [highlight, ...current]);
+      if (!selection) return;
+      await addSessionHighlight(selection, color);
       setToolTab("highlights");
       window.getSelection()?.removeAllRanges();
       setSelection(null);
     },
-    [readerDocument, selection],
+    [addSessionHighlight, selection],
   );
 
   const addNote = useCallback(
     async (markdown: string) => {
-      if (!readerDocument) return;
-      const now = new Date().toISOString();
-      const note: Note = {
-        id: createId("note"),
-        documentId: readerDocument.id,
-        scope: selection ? "selection" : "page",
-        pageNumber: selection?.pageNumber ?? paneStates.original.pageNumber,
-        source: selection?.source,
-        selectedText: selection?.text,
-        rects: selection?.rects,
-        markdown,
-        createdAt: now,
-        updatedAt: now,
-      };
-      await saveNote(note);
-      setNotes((current) => [note, ...current]);
+      await addSessionNote(markdown, selection);
       setToolTab("notes");
     },
-    [paneStates.original.pageNumber, readerDocument, selection],
-  );
-
-  const updateNote = useCallback(async (note: Note, markdown: string) => {
-    const next = {
-      ...note,
-      markdown,
-      updatedAt: new Date().toISOString(),
-    };
-    await saveNote(next);
-    setNotes((current) =>
-      current.map((candidate) => (candidate.id === next.id ? next : candidate)),
-    );
-  }, []);
-
-  const removeNote = useCallback(async (id: string) => {
-    await deleteNote(id);
-    setNotes((current) => current.filter((note) => note.id !== id));
-  }, []);
-
-  const removeHighlight = useCallback(async (id: string) => {
-    await deleteHighlight(id);
-    setHighlights((current) =>
-      current.filter((highlight) => highlight.id !== id),
-    );
-  }, []);
-
-  const askQuestion = useCallback(
-    async (
-      question: string,
-      scope: "selection" | "page" | "blocks",
-      blockIds: string[],
-    ) => {
-      if (!readerDocument || !settings) return;
-      const documentId = readerDocument.id;
-      const runId = questionRunRef.current + 1;
-      questionRunRef.current = runId;
-      const ownsActiveDocument = () =>
-        questionRunRef.current === runId &&
-        currentDocumentIdRef.current === documentId;
-      const sourceText =
-        scope === "selection" && selection
-          ? selection.text
-          : scope === "blocks"
-            ? blocks
-                .filter((block) => blockIds.includes(block.id))
-                .map((block) => block.text)
-                .join("\n")
-          : blocks
-              .filter(
-                (block) => block.pageNumber === paneStates.original.pageNumber,
-              )
-              .map((block) => block.text)
-              .join("\n");
-      if (!sourceText.trim()) {
-        setError("질문에 사용할 원문을 찾지 못했습니다.");
-        return;
-      }
-      setAsking(true);
-      setError(null);
-      setToolTab("ask");
-      const now = new Date().toISOString();
-      const existing = sessions[0];
-      const session: ChatSession =
-        existing ??
-        {
-          id: createId("chat"),
-          documentId: readerDocument.id,
-          title: question.slice(0, 50),
-          messages: [],
-          createdAt: now,
-          updatedAt: now,
-        };
-      const userMessage: ChatMessage = {
-        id: createId("message"),
-        sessionId: session.id,
-        role: "user",
-        content: question,
-        sourceText,
-        createdAt: now,
-      };
-      const withQuestion = {
-        ...session,
-        messages: [...session.messages, userMessage],
-        updatedAt: now,
-      };
-      setSessions((current) => [
-        withQuestion,
-        ...current.filter((candidate) => candidate.id !== session.id),
-      ]);
-      await saveChatSession(withQuestion);
-      if (!ownsActiveDocument()) return;
-
-      try {
-        const answer = await completeChat(
-          settings,
-          questionMessages(question, sourceText, settings.targetLanguage),
-        );
-        for (let length = 12; length < answer.length; length += 12) {
-          if (!ownsActiveDocument()) return;
-          setStreamingAnswer(answer.slice(0, length));
-          await wait(12);
-        }
-        if (!ownsActiveDocument()) return;
-        setStreamingAnswer(answer);
-        const assistantMessage: ChatMessage = {
-          id: createId("message"),
-          sessionId: session.id,
-          role: "assistant",
-          content: answer,
-          sourceText,
-          createdAt: new Date().toISOString(),
-        };
-        const completed = {
-          ...withQuestion,
-          messages: [...withQuestion.messages, assistantMessage],
-          updatedAt: assistantMessage.createdAt,
-        };
-        await saveChatSession(completed);
-        if (!ownsActiveDocument()) return;
-        setSessions((current) => [
-          completed,
-          ...current.filter((candidate) => candidate.id !== session.id),
-        ]);
-        setStreamingAnswer("");
-      } catch (cause) {
-        if (ownsActiveDocument()) {
-          setStreamingAnswer("");
-          setError(cause instanceof Error ? cause.message : String(cause));
-        }
-      } finally {
-        if (ownsActiveDocument()) setAsking(false);
-      }
-    },
-    [
-      blocks,
-      paneStates.original.pageNumber,
-      readerDocument,
-      selection,
-      sessions,
-      settings,
-    ],
+    [addSessionNote, selection],
   );
 
   const saveAnswerAsNote = useCallback(
     async (answer: string) => {
-      await addNote(`## LLM 답변\n\n${answer}`);
+      await addNote(`## Ask 답변\n\n${answer}`);
     },
     [addNote],
   );
 
-  const saveSettings = useCallback(async (next: LlmSettings) => {
-    await saveLlmSettings(next);
-    setSettings(next);
-    setSettingsOpen(false);
-    setNotice("LLM 설정을 저장했습니다.");
-  }, []);
+  const goToSourcePage = useCallback(
+    (pageNumber: number) => {
+      updatePane("original", { pageNumber, relativeOffsetY: 0 });
+      setActivePane("original");
+      if (expandedPane === "companion") setExpandedPane(null);
+    },
+    [expandedPane, updatePane],
+  );
 
-  const testSettings = useCallback(async (draft: LlmSettings) => {
-    setSettingsTesting(true);
-    setError(null);
-    try {
-      await completeChat(draft, [
-        {
-          role: "user",
-          content: "Reply with exactly OK.",
-        },
-      ]);
-      setNotice("LLM 연결에 성공했습니다.");
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setSettingsTesting(false);
+  const clearReferencePreviewCloseTimer = useCallback(() => {
+    if (referenceCloseTimerRef.current !== null) {
+      window.clearTimeout(referenceCloseTimerRef.current);
+      referenceCloseTimerRef.current = null;
     }
   }, []);
 
-  const openRetypesetReview = useCallback(async () => {
-    if (!readerDocument || !settings || !blocks.length) {
-      setError("텍스트 분석이 끝난 뒤 재조판할 수 있습니다.");
-      return;
-    }
-    const previous = await loadRetypesetProject(readerDocument.id);
-    const next = createRetypesetProject(
-      readerDocument.id,
-      settings.targetLanguage || "ko",
-      settings.activeProfileId,
-      previous,
-    );
-    await saveRetypesetProject(next);
-    setRetypesetProject(next);
-    setRetypesetOpen(true);
-  }, [blocks.length, readerDocument, settings]);
+  const updateReferenceHover = useCallback(
+    (event: ReferencePreviewHoverEvent) => {
+      referenceHoverStateRef.current =
+        nextReferencePreviewHoverState(
+          referenceHoverStateRef.current,
+          event,
+        );
+      return referenceHoverStateRef.current;
+    },
+    [],
+  );
 
-  const requestTransmissionConsent = useCallback(async (): Promise<boolean> => {
-    if (!settings) return false;
-    const signature = modelConnectionSignature(settings);
-    if (settings.transmissionConsentKey === signature) return true;
-    const profile = activeModelProfile(settings);
-    const destination =
-      profile.connectionMode === "codex"
-        ? "이 PC의 Codex 로그인"
-        : `${profile.name} (${profile.endpoint})`;
-    const accepted = window.confirm(
-      [
-        `번역 대상 본문과 캡션을 ${destination}에 전송합니다.`,
-        "",
-        "PDF 파일, 그림·표 원본, 참고문헌은 전송하지 않습니다.",
-        "논문의 핵심 내용 대부분이 본문에 포함된다는 점을 확인해 주세요.",
-      ].join("\n"),
-    );
-    if (!accepted) return false;
-    const next = { ...settings, transmissionConsentKey: signature };
-    await saveLlmSettings(next);
-    setSettings(next);
-    return true;
-  }, [settings]);
+  const openReferencePreview = useCallback(
+    (
+      paneId: PaneId,
+      reference: DocumentReference,
+      anchor: ReferenceAnchor,
+    ) => {
+      if (referenceHoverStateRef.current.pinned) return;
+      clearReferencePreviewCloseTimer();
+      referenceHoverStateRef.current = {
+        token: false,
+        card: false,
+        pinned: false,
+        open: false,
+      };
+      updateReferenceHover("token-enter");
+      setSelectedReference({
+        reference,
+        anchor,
+        pane: paneId === "original" ? "source" : "korean",
+        pinned: false,
+      });
+    },
+    [clearReferencePreviewCloseTimer, updateReferenceHover],
+  );
 
-  const statusText = useMemo(() => {
-    if (!readerDocument) return "준비됨";
-    const viewLabel =
-      splitMode === "single"
-        ? "원문"
-        : splitMode === "side-by-side"
-          ? "좌우 분할"
-          : "상하 분할";
-    return `${viewLabel} · ${syncEnabled ? "동기화됨" : "독립 보기"}`;
-  }, [readerDocument, splitMode, syncEnabled]);
+  const pinReferencePreview = useCallback(
+    (
+      paneId: PaneId,
+      reference: DocumentReference,
+      anchor: ReferenceAnchor,
+    ) => {
+      clearReferencePreviewCloseTimer();
+      referenceHoverStateRef.current = {
+        token: true,
+        card: false,
+        pinned: false,
+        open: true,
+      };
+      updateReferenceHover("pin");
+      setSelectedReference({
+        reference,
+        anchor,
+        pane: paneId === "original" ? "source" : "korean",
+        pinned: true,
+      });
+    },
+    [clearReferencePreviewCloseTimer, updateReferenceHover],
+  );
+
+  const closePinnedReferencePreview = useCallback(() => {
+    clearReferencePreviewCloseTimer();
+    referenceHoverStateRef.current = {
+      token: false,
+      card: false,
+      pinned: false,
+      open: false,
+    };
+    setSelectedReference(null);
+  }, [clearReferencePreviewCloseTimer]);
+
+  const scheduleReferencePreviewClose = useCallback(() => {
+    clearReferencePreviewCloseTimer();
+    referenceCloseTimerRef.current = window.setTimeout(() => {
+      const next = updateReferenceHover("close-timeout");
+      if (!next.open) setSelectedReference(null);
+      referenceCloseTimerRef.current = null;
+    }, 220);
+  }, [clearReferencePreviewCloseTimer, updateReferenceHover]);
+
+  const leaveReferenceToken = useCallback(() => {
+    updateReferenceHover("token-leave");
+    scheduleReferencePreviewClose();
+  }, [scheduleReferencePreviewClose, updateReferenceHover]);
+
+  const enterReferenceCard = useCallback(() => {
+    clearReferencePreviewCloseTimer();
+    updateReferenceHover("card-enter");
+  }, [clearReferencePreviewCloseTimer, updateReferenceHover]);
+
+  const leaveReferenceCard = useCallback(() => {
+    updateReferenceHover("card-leave");
+    scheduleReferencePreviewClose();
+  }, [scheduleReferencePreviewClose, updateReferenceHover]);
+
+  const statusText = readerDocument
+    ? `원문·한국어 독립 보기 · ${
+        koreanDocument ? "저장된 한국어 논문" : "한국어 논문 미생성"
+      }`
+    : "준비됨";
 
   return (
     <div className="app-shell">
@@ -1165,37 +495,21 @@ function App() {
       <TopBar
         hasDocument={Boolean(pdfDocument)}
         title={readerDocument?.title ?? ""}
-        pageCount={pageCount}
-        viewState={activeState}
-        splitMode={splitMode}
-        syncEnabled={syncEnabled}
-        translationRunning={translationJob?.status === "running"}
+        models={paperModels}
+        activeModelId={activeModelId}
+        effortOptions={effortOptions}
+        effort={settings?.effort ?? "default"}
         onOpen={() => void openPdf()}
-        onPage={setPage}
-        onZoom={setZoom}
-        onFit={(scaleValue) => updateFromToolbar({ scaleValue })}
-        onRotate={rotate}
-        onSplitMode={changeSplitMode}
-        onToggleSync={toggleSync}
-        onTranslatePage={() =>
-          void startTranslation({
-            kind: "page",
-            pageNumber: paneStates.original.pageNumber,
-          })
-        }
+        onModel={(modelId) => void selectPaperModel(modelId)}
+        onEffort={(effort) => void selectReasoningEffort(effort)}
         onSettings={() => setSettingsOpen(true)}
       />
 
       <div className="workspace">
         <Sidebar
           documents={documents}
-          folders={folders}
           activeDocumentId={readerDocument?.id}
-          scanning={scanning}
           onOpenDocument={(document) => void openLibraryDocument(document)}
-          onAddFolder={() => void addLibraryFolder()}
-          onRescanFolder={(folder) => void rescanFolder(folder)}
-          onSetTags={(documentId, tags) => void updateTags(documentId, tags)}
         />
 
         <div className="reader-region">
@@ -1223,7 +537,7 @@ function App() {
               <span>
                 {loading
                   ? "논문을 여는 중"
-                  : `텍스트 분석 중 · ${Math.round(analysisProgress * 100)}%`}
+                  : `논문 구조 분석 중 · ${Math.round(analysisProgress * 100)}%`}
               </span>
             </div>
           )}
@@ -1231,49 +545,138 @@ function App() {
           {!pdfDocument ? (
             <EmptyReader onOpen={() => void openPdf()} />
           ) : (
-            <main className={`reader-grid reader-grid--${splitMode}`}>
+            <main
+              className={`reader-grid reader-grid--bilingual ${
+                expandedPane ? `reader-grid--expanded-${expandedPane}` : ""
+              }`}
+            >
               <PdfPane
                 document={pdfDocument}
                 paneId="original"
-                label="원문"
+                label="영어 원문"
                 detail={readerDocument?.title ?? ""}
                 targetState={paneStates.original}
                 active={activePane === "original"}
+                expanded={expandedPane === "original"}
                 blocks={blocks}
-                translations={translations}
                 highlights={highlights}
-                references={references}
-                translationOverlay={false}
+                references={sourcePreviewReferences}
                 onActivate={setActivePane}
                 onUpdate={updatePane}
+                onToggleExpand={(paneId) =>
+                  setExpandedPane((current) =>
+                    current === paneId ? null : paneId,
+                  )
+                }
                 onSelection={setSelection}
                 onWordLookup={(nextSelection) => void lookupWord(nextSelection)}
-                onReference={setSelectedReference}
-                onEditTranslation={(translation, text) =>
-                  void editTranslation(translation, text)
-                }
+                onReferenceEnter={openReferencePreview}
+                onReferencePin={pinReferencePreview}
+                onReferenceLeave={leaveReferenceToken}
               />
-              {splitMode !== "single" && (
-                <PdfPane
-                  document={pdfDocument}
-                  paneId="companion"
-                  label="번역 뷰"
-                  detail={`${settings?.targetLanguage ?? "ko"} · 위치 보존 조판`}
-                  targetState={paneStates.companion}
-                  active={activePane === "companion"}
-                  blocks={blocks}
-                  translations={translations}
-                  highlights={highlights}
-                  references={references}
-                  translationOverlay={translationOverlay}
-                  onActivate={setActivePane}
-                  onUpdate={updatePane}
-                  onSelection={setSelection}
-                  onWordLookup={(nextSelection) => void lookupWord(nextSelection)}
-                  onReference={setSelectedReference}
-                  onEditTranslation={(translation, text) =>
-                    void editTranslation(translation, text)
+
+              {koreanDocument ? (
+                <div className="korean-pane-shell">
+                  <div className="korean-pane-actions">
+                    {retypesetProject?.tokenUsage && (
+                      <small className="korean-token-usage">
+                        {tokenUsageLabel(retypesetProject.tokenUsage)}
+                      </small>
+                    )}
+                    <button
+                      type="button"
+                      disabled={koreanBuild.phase !== "idle"}
+                      onClick={() => setEditingKorean(true)}
+                    >
+                      <Pencil size={14} />
+                      내용 수정
+                    </button>
+                    <button
+                      type="button"
+                      disabled={koreanBuild.phase !== "idle"}
+                      onClick={() => void exportKoreanPaper()}
+                    >
+                      <Download size={14} />
+                      PDF 내보내기
+                    </button>
+                    <button
+                      type="button"
+                      disabled={koreanBuild.phase !== "idle"}
+                      onClick={() => void buildKoreanPaper(true)}
+                    >
+                      <RefreshCw size={14} />
+                      다시 만들기
+                    </button>
+                  </div>
+                  {koreanBuild.phase !== "idle" && (
+                    <div className="korean-build-banner" role="status">
+                      <LoaderCircle className="spin" size={14} />
+                      <span>{koreanBuild.message}</span>
+                      {koreanBuild.total > 0 && (
+                        <small>
+                          {koreanBuild.completed} / {koreanBuild.total}
+                        </small>
+                      )}
+                      {koreanBuild.tokenUsage && (
+                        <small>
+                          {tokenUsageLabel(koreanBuild.tokenUsage)}
+                        </small>
+                      )}
+                    </div>
+                  )}
+                  <PdfPane
+                    document={koreanDocument}
+                    paneId="companion"
+                    label="한국어 논문"
+                    detail="자동 생성된 로컬 재조판본"
+                    targetState={paneStates.companion}
+                    active={activePane === "companion"}
+                    expanded={expandedPane === "companion"}
+                    blocks={koreanBlocks}
+                    highlights={highlights}
+                    references={koreanReferences}
+                    onActivate={setActivePane}
+                    onUpdate={updatePane}
+                    onToggleExpand={(paneId) =>
+                      setExpandedPane((current) =>
+                        current === paneId ? null : paneId,
+                      )
+                    }
+                    onSelection={setSelection}
+                    onWordLookup={(nextSelection) =>
+                      void lookupWord(nextSelection)
+                    }
+                    onReferenceEnter={openReferencePreview}
+                    onReferencePin={pinReferencePreview}
+                    onReferenceLeave={leaveReferenceToken}
+                  />
+                  {editingKorean && (
+                    <KoreanPaperEditor
+                      key={retypesetProject?.updatedAt ?? "editor"}
+                      blocks={
+                        retypesetProject?.documentStructure?.blocks ??
+                        blocks
+                      }
+                      translations={translations}
+                      saving={koreanBuild.phase !== "idle"}
+                      onCancel={() => setEditingKorean(false)}
+                      onSave={(edits) => void applyKoreanEdits(edits)}
+                    />
+                  )}
+                </div>
+              ) : (
+                <KoreanPaperEmpty
+                  analyzing={analyzing || !blocks.length}
+                  working={koreanBuild.phase !== "idle"}
+                  progressMessage={koreanBuild.message}
+                  completed={koreanBuild.completed}
+                  total={koreanBuild.total}
+                  tokenUsage={
+                    koreanBuild.tokenUsage ??
+                    retypesetProject?.tokenUsage
                   }
+                  modelName={activeProfile?.name ?? ""}
+                  onCreate={() => void buildKoreanPaper(false)}
                 />
               )}
             </main>
@@ -1298,11 +701,9 @@ function App() {
             </span>
             <span>
               {readerDocument
-                ? `p. ${paneStates.original.pageNumber} · ${Math.round(
-                    paneStates.original.scale * 100,
-                  )}% · ${paneStates.original.rotation}° · 번역 ${Math.round(
-                    (readerDocument.translationProgress ?? 0) * 100,
-                  )}%`
+                ? `원문 p.${paneStates.original.pageNumber} · 한국어 ${
+                    koreanDocument ? `p.${paneStates.companion.pageNumber}` : "—"
+                  }`
                 : "Paperloom 0.3.0"}
             </span>
           </footer>
@@ -1311,57 +712,58 @@ function App() {
         <ToolRail
           activeTab={toolTab}
           hasDocument={Boolean(readerDocument)}
-          pageNumber={paneStates.original.pageNumber}
-          pageCount={pageCount}
-          blocks={blocks}
-          translations={translations}
-          translationJob={translationJob}
           selection={selection}
           highlights={highlights}
           notes={notes}
           sessions={sessions}
-          references={references}
+          references={sourcePreviewReferences}
           dictionaryEntry={dictionaryEntry}
           dictionaryLoading={dictionaryLoading}
           asking={asking}
           streamingAnswer={streamingAnswer}
           error={null}
           onTab={setToolTab}
-          onTranslate={(scope) => void startTranslation(scope)}
-          onOpenRetypeset={() => void openRetypesetReview()}
-          onCancelTranslation={() => {
-            cancelTranslationRef.current = true;
-          }}
-          onEditTranslation={(translation, text) =>
-            void editTranslation(translation, text)
-          }
-          onAsk={(question, scope, blockIds) =>
-            void askQuestion(question, scope, blockIds)
-          }
+          onAsk={(question) => void askQuestion(question)}
           onCopy={(text) => void navigator.clipboard.writeText(text)}
           onSaveAnswerAsNote={(text) => void saveAnswerAsNote(text)}
           onAddNote={(markdown) => void addNote(markdown)}
           onUpdateNote={(note, markdown) => void updateNote(note, markdown)}
           onDeleteNote={(id) => void removeNote(id)}
           onDeleteHighlight={(id) => void removeHighlight(id)}
-          onGoToPage={setPage}
-          onOpenReference={setSelectedReference}
-          onCloseDictionary={() => setDictionaryEntry(null)}
+          onGoToPage={goToSourcePage}
+          onOpenReference={(reference) =>
+            openReferencePreview(
+              "original",
+              reference,
+              {
+                left: window.innerWidth - 340,
+                top: 104,
+                right: window.innerWidth - 320,
+                bottom: 120,
+                width: 20,
+                height: 16,
+              },
+            )
+          }
+          onCloseDictionary={closeDictionary}
         />
       </div>
 
       {selection && (
         <div
           className="selection-toolbar"
+          onPointerDown={(event) => event.preventDefault()}
           style={{
-            left: Math.min(selection.clientX, window.innerWidth - 280),
+            left: Math.min(selection.clientX, window.innerWidth - 230),
             top: Math.max(64, selection.clientY - 52),
           }}
         >
           <button
             type="button"
             title="하이라이트"
-            onClick={() => void addHighlightFromSelection("rgba(255, 214, 92, .42)")}
+            onClick={() =>
+              void addHighlightFromSelection("rgba(255, 214, 92, .42)")
+            }
           >
             <Bookmark size={14} />
           </button>
@@ -1372,14 +774,7 @@ function App() {
           >
             <StickyNote size={14} />
           </button>
-          <button
-            type="button"
-            title="선택 영역 번역"
-            onClick={() => void startTranslation({ kind: "selection" })}
-          >
-            <Languages size={14} />
-          </button>
-          <button type="button" title="질문" onClick={() => setToolTab("ask")}>
+          <button type="button" title="질문 초점으로 사용" onClick={() => setToolTab("ask")}>
             <MessageSquareText size={14} />
           </button>
           <button
@@ -1405,54 +800,20 @@ function App() {
       {selectedReference && pdfDocument && (
         <FigurePreview
           document={pdfDocument}
-          reference={selectedReference}
-          translatedCaption={
-            translations.find(
-              (translation) =>
-                translation.blockId === selectedReference.targetBlockId &&
-                translation.status === "translated",
-            )?.translatedText
-          }
-          onClose={() => setSelectedReference(null)}
+          reference={selectedReference.reference}
+          anchor={selectedReference.anchor}
+          caption={selectedPreviewCaption}
+          pinned={selectedReference.pinned}
+          onEnter={enterReferenceCard}
+          onLeave={leaveReferenceCard}
+          onClose={closePinnedReferencePreview}
           onGoToPage={(pageNumber) => {
-            setPage(pageNumber);
+            goToSourcePage(pageNumber);
             setSelectedReference(null);
           }}
         />
       )}
 
-      {retypesetOpen &&
-        retypesetProject &&
-        pdfDocument &&
-        currentPdfBytesRef.current &&
-        readerDocument &&
-        settings && (
-          <Suspense
-            fallback={
-              <div className="retypeset-backdrop">
-                <div className="global-loading">
-                  <LoaderCircle className="spin" size={22} />
-                  <span>재조판 도구를 준비하는 중</span>
-                </div>
-              </div>
-            }
-          >
-            <RetypesetReviewDialog
-              sourceDocument={pdfDocument}
-              sourceBytes={currentPdfBytesRef.current}
-              readerDocument={readerDocument}
-              blocks={blocks}
-              references={references}
-              translations={translations}
-              settings={settings}
-              project={retypesetProject}
-              onClose={() => setRetypesetOpen(false)}
-              onProject={setRetypesetProject}
-              onTranslations={setTranslations}
-              onRequestTransmissionConsent={requestTransmissionConsent}
-            />
-          </Suspense>
-        )}
     </div>
   );
 }

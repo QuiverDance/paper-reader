@@ -1,82 +1,131 @@
-# Paperloom semantic re-typesetting specification
+# Paperloom bilingual Korean-paper viewer specification
 
 ## Goal
 
-Preserve the local-first PDF reader while adding a separate, reviewable Korean
-translation re-typeset that reads like a composed academic paper.
+Make an unchanged English source paper and a saved Korean re-typeset easy to
+read together. Korean is the only user-facing translation target in the first
+release.
+
+## Primary flow
+
+1. The user opens a PDF.
+2. Paperloom identifies it from a hash of the file contents.
+3. The main viewer opens side by side: source on the left, Korean paper on the
+   right. Both panes navigate independently and either pane can expand.
+4. If an accepted Korean paper already exists, Paperloom restores it without
+   translation. Otherwise the right pane shows `한국어 논문 만들기`.
+5. Generation translates semantic sections with a paper-wide terminology brief,
+   checkpoints completed work, composes a Korean PDF, validates it automatically,
+   and applies it in the Korean pane without opening a modal.
+6. The applied result, protected manual corrections, warnings, and Ask history
+   are stored locally and restored on the next open.
 
 ## In scope
 
-- Library folders, recursive PDF discovery, rescan, missing-file state, search,
-  recent documents, and user tags.
-- PDF.js text extraction into normalized document blocks with basic title,
-  heading, paragraph, caption, footnote, and unknown classification.
-- OpenAI-compatible provider settings stored locally.
-- Named model connection profiles with secrets stored separately from project
-  data, plus an optional beta Codex-session bridge.
-- Block translation for a selection, page, page range, or whole document;
-  progress, cancellation between batches, retry, cache, editing, masking, and
-  in-place re-typesetting.
-- Semantic section analysis and hierarchical section translation independent of
-  source page boundaries.
-- A resumable local re-typeset project with protected manual corrections and
-  section checkpoints.
-- Korean academic typography, source page size and column-count preservation,
-  anchored vector figure/table regions, and source-preserving equation handling.
-- Side-by-side review with integrity blockers, visual warnings, direct
-  translation editing, and translated PDF export.
-- A one-time, size-disclosed Korean typesetting package installed locally.
-- Word lookup using the configured provider with a local context cache.
-- Figure/Table reference detection and caption-target preview.
-- Original/translation highlights and document/page/selection notes.
-- Questions over selected text, the current page, or chosen blocks, with
-  incremental answer display, history, source display, copy, and save-as-note.
-- Persistence in SQLite in Tauri and a browser local-storage fallback for
-  development.
+- PDF open, recent papers, and recent-title search.
+- Independent source/Korean page, zoom, fit, rotate, and pane expansion controls.
+- Named direct-API and Codex model profiles.
+- Model profile and supported reasoning-effort switching in the main viewer.
+- Digital-PDF semantic analysis into title, heading, prose, caption, footnote,
+  equation, reference, running-furniture, and preserved-code concepts.
+- One explicit whole-paper Korean generation action; no generation on open.
+- Hierarchical section translation with a paper-wide translation brief,
+  checkpoints, cancellation, retry, and protected manual corrections.
+- Translation requests operate on logical paragraphs: physical PDF fragments
+  split across columns or pages are joined before translation and rendered once
+  from their first fragment. Paragraph starts are inferred from source
+  indentation, vertical spacing, bold leads, and heading boundaries rather than
+  capitalization alone, so a capitalized sentence may still continue across a
+  page. Locked manual corrections remain merge barriers.
+- Inline equations and citations are protected as immutable translation tokens.
+  Korean rendering uses an embedded math-symbol fallback font so Greek letters
+  and operators remain visible, while source bold leads and fully bold blocks
+  retain their weight.
+- The source title and author region is copied from the source page before the
+  translated Abstract and body are composed, preserving its original positions,
+  font weights, and mixed author/affiliation styling.
+- Continuous Korean prose flow around source-registered figure, table, and code
+  slots. Every source page has a corresponding Korean page, and each asset keeps
+  its source page, coordinates, dimensions, and complete unclipped content.
+  Prose-only continuation pages may be inserted when the remaining text cannot
+  fit readably around those fixed slots.
+- Automatic integrity blockers, visual warnings, inline post-generation
+  translation editing, safe replacement candidates, and PDF export.
+- Highlights, paper-level notes, contextual term lookup, and figure/table
+  reference preview.
+- One persistent paper-wide Ask thread with copy and save-as-note.
+- Ask selected text as optional focus, never as the sole context.
+- Native source-PDF Ask input when the selected API profile declares support;
+  otherwise filtered paper-wide text or a cached hierarchical digest.
+- Ask answers with verified source page/section evidence links when resolvable.
+- SQLite persistence in Tauri and browser fallbacks for development.
+
+## Removed
+
+- Selection, current-page, page-range, and whole-document coordinate translation.
+- Translation overlays, in-place source patching, and their translation list,
+  edit, retry, masking, and progress UI.
+- Ask selection/page/manual-block scope controls.
+- Linked pane navigation and manual stacked layout. Narrow windows may stack
+  responsively.
+- Target-language selection.
+- Watched folders, recursive scanning, tags, and missing-file management.
+- OpenCode TOML configuration import.
+
+Legacy local records for removed features are not deleted automatically.
 
 ## Explicitly out of scope
 
-- OCR for scanned PDFs.
-- Translation of equations, table cells, or text inside figures.
+- OCR-backed Korean re-typesetting for scanned PDFs.
+- Translation of equations, table cells, source code, or text inside figures.
 - Cross-document RAG, embeddings, vector databases, clustering, or comparison.
 - Cloud sync, accounts, and collaboration.
-- Generic third-party ChatGPT OAuth. The beta Codex bridge delegates sign-in to
-  the official local Codex interface.
+- Generic third-party ChatGPT OAuth. The optional Codex bridge delegates sign-in
+  to the official local Codex interface.
+- Pixel-identical prose pagination or freely floating assets that leave their
+  source-corresponding page, coordinates, or dimensions.
 
 ## Important decisions
 
-1. The PDF remains the source of truth and is never modified.
-2. All page geometry is stored as normalized coordinates.
-3. In-place HTML reflow remains a fast reading aid. A final translated document
-   is created from a semantic paper model as a separate PDF.
-4. The LLM adapter has one small interface and uses a Tauri HTTP command in the
-   desktop app; browser development uses `fetch`.
-5. API keys are local settings and are never logged or included in repository
-   files.
-6. A scanned/empty-text page remains readable but reports that text tools are
-   unavailable.
-7. Translation cancellation is cooperative between batches. An already
-   submitted provider request may finish, but no later batch is sent.
-8. The first Figure/Table preview may show a generous region around the matched
-   caption when a precise object boundary cannot be inferred.
-9. Re-typeset translation operates on a top-level section and all descendant
-   subsections as one context; oversize sections split only at subsection seams.
-10. Missing translations, damaged assets/equations, and broken links block
-    export. Spacing and pagination warnings may be acknowledged.
-11. The quality-guaranteed first target is digital English-to-Korean. Scanned
-    and image-only PDFs remain unsupported.
-12. Exported PDFs carry a restrained unofficial-translation note and metadata.
+1. The source PDF remains authoritative and is never modified.
+2. Source identity comes from exact PDF contents, not its name or path.
+3. Korean generation and Ask share the active paper model, but switching a
+   model never regenerates an accepted Korean paper implicitly.
+4. Regeneration creates a candidate. The current result remains readable until
+   the candidate succeeds and passes automatic integrity validation, after which
+   it is applied atomically without a manual acceptance step.
+5. Translation sends only translatable prose. Native-PDF Ask may send the whole
+   PDF after disclosure, including metadata and references, while instructing
+   the model not to use excluded material as answer evidence.
+6. Native PDF upload is lazy on first Ask, reused per paper/provider, and remote
+   deletion is requested when the project or provider connection is removed.
+7. Paper-wide Ask context includes title, abstract, headings, body, explanatory
+   footnotes, and captions; it excludes proceedings covers, affiliations,
+   contacts, and bibliography from answer evidence.
+8. Paper-wide context is never silently truncated. Oversize text uses a cached
+   hierarchical section digest and discloses that fact in the UI.
+9. Content-integrity failures block automatic application and export. Visual
+   layout warnings remain visible but do not silently drop content.
+10. The quality-guaranteed first target is digital English-to-Korean.
+11. Figures, tables, and code listings remain in source-registered asset slots;
+    only Korean prose reflows around them or onto continuation pages.
+12. Registered title/author front matter establishes the shared body-flow start
+    below that region. Equation and algorithm crops include a small stroke-safe
+    margin so glyphs and rules outside the extracted text box are not clipped.
+13. Page extraction and independent section translation use bounded parallelism;
+    translation checkpoints are serialized before persistence.
 
 ## Completion checks
 
-- Existing reader-state tests remain green.
-- Pure block extraction, reference detection, and provider response parsing are
-  covered by unit tests.
-- Production frontend build succeeds.
-- Semantic analysis, section grouping, review validation, and PDF layout are
-  covered by pure tests.
-- A generated multi-page PDF can be opened and exercised in single, split,
-  translated, annotated, and question-tool states.
-- A Korean re-typeset fixture renders with selectable Korean text, intact
-  preserved assets, and no integrity blockers before export.
+- Unit tests cover content identity, filtered paper-wide context, digest choice,
+  provider PDF capability selection, evidence parsing, semantic extraction,
+  source-registered asset placement, and provider response parsing.
+- Reader-state tests verify independent panes and no persisted sync dependency.
+- Reopening the same PDF bytes from another path restores the accepted Korean
+  paper and project.
+- A production frontend build succeeds.
+- A generated multi-page Korean PDF contains selectable Korean text, preserved
+  assets/code, and no integrity blockers before export.
+- The main screen is visually exercised in empty-Korean, generating, restored,
+  expanded-pane, Ask, and inline-editing states.
 - Tauri source compiles when the Rust toolchain is available.

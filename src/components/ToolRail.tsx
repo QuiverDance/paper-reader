@@ -2,14 +2,10 @@ import {
   Bookmark,
   Check,
   Copy,
-  FileOutput,
-  Languages,
+  FileText,
   LoaderCircle,
   MessageSquareText,
   PanelRightClose,
-  Pause,
-  Play,
-  RotateCcw,
   ScanText,
   Send,
   StickyNote,
@@ -17,34 +13,20 @@ import {
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import { askContextLabel } from "../lib/paper-context";
 import type {
   ChatSession,
   DictionaryEntry,
-  DocumentBlock,
   DocumentReference,
   Highlight,
   Note,
   ReadingToolTab,
   TextSelection,
-  TranslationJob,
-  TranslationRecord,
 } from "../types";
-
-export type TranslationScopeRequest =
-  | { kind: "page"; pageNumber: number }
-  | { kind: "range"; startPage: number; endPage: number }
-  | { kind: "document" }
-  | { kind: "selection" }
-  | { kind: "failed" };
 
 type ToolRailProps = {
   activeTab: ReadingToolTab;
   hasDocument: boolean;
-  pageNumber: number;
-  pageCount: number;
-  blocks: DocumentBlock[];
-  translations: TranslationRecord[];
-  translationJob: TranslationJob | null;
   selection: TextSelection | null;
   highlights: Highlight[];
   notes: Note[];
@@ -56,15 +38,7 @@ type ToolRailProps = {
   streamingAnswer: string;
   error: string | null;
   onTab: (tab: ReadingToolTab) => void;
-  onTranslate: (scope: TranslationScopeRequest) => void;
-  onOpenRetypeset: () => void;
-  onCancelTranslation: () => void;
-  onEditTranslation: (translation: TranslationRecord, text: string) => void;
-  onAsk: (
-    question: string,
-    scope: "selection" | "page" | "blocks",
-    blockIds: string[],
-  ) => void;
+  onAsk: (question: string) => void;
   onCopy: (text: string) => void;
   onSaveAnswerAsNote: (text: string) => void;
   onAddNote: (markdown: string) => void;
@@ -79,9 +53,8 @@ type ToolRailProps = {
 const TABS: Array<{
   id: ReadingToolTab;
   label: string;
-  icon: typeof Languages;
+  icon: typeof MessageSquareText;
 }> = [
-  { id: "translation", label: "번역", icon: Languages },
   { id: "ask", label: "Ask", icon: MessageSquareText },
   { id: "notes", label: "메모", icon: StickyNote },
   { id: "highlights", label: "표시", icon: Bookmark },
@@ -91,11 +64,6 @@ const TABS: Array<{
 export function ToolRail({
   activeTab,
   hasDocument,
-  pageNumber,
-  pageCount,
-  blocks,
-  translations,
-  translationJob,
   selection,
   highlights,
   notes,
@@ -107,10 +75,6 @@ export function ToolRail({
   streamingAnswer,
   error,
   onTab,
-  onTranslate,
-  onOpenRetypeset,
-  onCancelTranslation,
-  onEditTranslation,
   onAsk,
   onCopy,
   onSaveAnswerAsNote,
@@ -123,14 +87,7 @@ export function ToolRail({
   onCloseDictionary,
 }: ToolRailProps) {
   const [question, setQuestion] = useState("");
-  const [questionScope, setQuestionScope] = useState<
-    "selection" | "page" | "blocks"
-  >("selection");
-  const [questionBlockIds, setQuestionBlockIds] = useState<string[]>([]);
   const [noteDraft, setNoteDraft] = useState("");
-  const [rangeStart, setRangeStart] = useState(1);
-  const [rangeEnd, setRangeEnd] = useState(1);
-
   const activeSession = sessions[0];
   const latestAnswer = useMemo(
     () =>
@@ -138,35 +95,6 @@ export function ToolRail({
         .reverse()
         .find((message) => message.role === "assistant")?.content ?? "",
     [activeSession],
-  );
-  const progress = translationJob
-    ? translationJob.totalBlocks
-      ? translationJob.completedBlocks / translationJob.totalBlocks
-      : 0
-    : 0;
-  const currentBlockIds = useMemo(
-    () => new Set(blocks.map((block) => block.id)),
-    [blocks],
-  );
-  const currentTranslations = useMemo(
-    () =>
-      translations.filter((translation) =>
-        currentBlockIds.has(translation.blockId),
-      ),
-    [currentBlockIds, translations],
-  );
-  const failedCount = currentTranslations.filter(
-    (translation) => translation.status === "failed",
-  ).length;
-  const pageQuestionBlocks = useMemo(
-    () =>
-      blocks.filter(
-        (block) => block.pageNumber === pageNumber && block.translatable,
-      ),
-    [blocks, pageNumber],
-  );
-  const activeQuestionBlockIds = questionBlockIds.filter((blockId) =>
-    pageQuestionBlocks.some((block) => block.id === blockId),
   );
 
   return (
@@ -240,216 +168,54 @@ export function ToolRail({
       {error && <p className="tool-error">{error}</p>}
 
       <div className="tool-content">
-        {activeTab === "translation" && (
-          <>
-            <section className="tool-card tool-card--accent">
-              <div className="tool-card-title">
-                <Languages size={16} />
-                <span>문단 좌표 번역</span>
-                <small>
-                  {blocks.length
-                    ? `${currentTranslations.filter((item) => item.status === "translated").length}/${blocks.filter((block) => block.translatable).length}`
-                    : "분석 중"}
-                </small>
-              </div>
-              {translationJob?.status === "running" ? (
-                <>
-                  <div className="progress-track">
-                    <span style={{ width: `${progress * 100}%` }} />
-                  </div>
-                  <p>
-                    {translationJob.completedBlocks} / {translationJob.totalBlocks}
-                    개 블록
-                  </p>
-                  <button
-                    type="button"
-                    className="secondary-action wide"
-                    onClick={onCancelTranslation}
-                  >
-                    <Pause size={14} /> 번역 중단
-                  </button>
-                </>
-              ) : (
-                <div className="translation-actions">
-                  <button
-                    type="button"
-                    disabled={!hasDocument}
-                    onClick={() => onTranslate({ kind: "page", pageNumber })}
-                  >
-                    <Play size={14} /> 현재 페이지
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!selection}
-                    onClick={() => onTranslate({ kind: "selection" })}
-                  >
-                    선택 영역
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!hasDocument}
-                    onClick={() => onTranslate({ kind: "document" })}
-                  >
-                    전체 논문
-                  </button>
-                </div>
-              )}
-            </section>
-
-            <button
-              type="button"
-              className="retypeset-launch"
-              disabled={!hasDocument || !blocks.length}
-              onClick={onOpenRetypeset}
-            >
-              <FileOutput size={15} />
-              <span>
-                <strong>한국어 논문 PDF 만들기</strong>
-                <small>섹션 번역 · 새 조판 · 검수 · 내보내기</small>
-              </span>
-            </button>
-
-            <section className="range-translation">
-              <span>페이지 범위</span>
-              <div>
-                <input
-                  type="number"
-                  min={1}
-                  max={pageCount || 1}
-                  value={rangeStart}
-                  onChange={(event) => setRangeStart(Number(event.target.value))}
-                />
-                <span>–</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={pageCount || 1}
-                  value={rangeEnd}
-                  onChange={(event) => setRangeEnd(Number(event.target.value))}
-                />
-                <button
-                  type="button"
-                  disabled={!hasDocument}
-                  onClick={() =>
-                    onTranslate({
-                      kind: "range",
-                      startPage: rangeStart,
-                      endPage: rangeEnd,
-                    })
-                  }
-                >
-                  실행
-                </button>
-              </div>
-            </section>
-
-            {failedCount > 0 && (
-              <button
-                type="button"
-                className="retry-action"
-                onClick={() => onTranslate({ kind: "failed" })}
-              >
-                <RotateCcw size={14} /> 실패한 {failedCount}개 다시 번역
-              </button>
-            )}
-
-            <div className="translation-list">
-              {currentTranslations
-                .filter((translation) => {
-                  const block = blocks.find(
-                    (candidate) => candidate.id === translation.blockId,
-                  );
-                  return block?.pageNumber === pageNumber;
-                })
-                .map((translation) => (
-                  <article
-                    key={translation.id}
-                    className={`translation-item translation-item--${translation.status}`}
-                  >
-                    <small>{translation.sourceText}</small>
-                    {translation.status === "failed" ? (
-                      <p>{translation.error}</p>
-                    ) : (
-                      <textarea
-                        defaultValue={translation.translatedText}
-                        onBlur={(event) =>
-                          onEditTranslation(translation, event.target.value)
-                        }
-                        aria-label="번역문 수정"
-                      />
-                    )}
-                  </article>
-                ))}
-            </div>
-          </>
-        )}
-
         {activeTab === "ask" && (
           <>
-            <div className="ask-scope">
-              <button
-                type="button"
-                className={questionScope === "selection" ? "active" : ""}
-                disabled={!selection}
-                onClick={() => setQuestionScope("selection")}
-              >
-                선택 문단
-              </button>
-              <button
-                type="button"
-                className={questionScope === "page" ? "active" : ""}
-                onClick={() => setQuestionScope("page")}
-              >
-                현재 페이지
-              </button>
-              <button
-                type="button"
-                className={questionScope === "blocks" ? "active" : ""}
-                disabled={!pageQuestionBlocks.length}
-                onClick={() => setQuestionScope("blocks")}
-              >
-                문단 선택
-              </button>
-            </div>
-            {questionScope === "selection" && selection && (
+            <section className="paper-context-card">
+              <FileText size={15} />
+              <span>
+                <strong>논문 전체 맥락</strong>
+                <small>
+                  PDF 지원 모델은 원본 파일, 그 외 모델은 전체 텍스트 또는
+                  계층형 요약을 사용합니다.
+                </small>
+              </span>
+            </section>
+
+            {selection && (
               <blockquote className="selection-context">
-                {selection.text.slice(0, 220)}
+                <span>선택 문장을 질문의 초점으로 자동 첨부</span>
+                {selection.text.slice(0, 260)}
               </blockquote>
             )}
-            {questionScope === "blocks" && (
-              <div className="question-block-picker">
-                {pageQuestionBlocks.map((block) => (
-                  <label key={block.id}>
-                    <input
-                      type="checkbox"
-                      checked={activeQuestionBlockIds.includes(block.id)}
-                      onChange={(event) =>
-                        setQuestionBlockIds((current) =>
-                          event.target.checked
-                            ? [...new Set([...current, block.id])]
-                            : current.filter((blockId) => blockId !== block.id),
-                        )
-                      }
-                    />
-                    <span>
-                      <small>{block.type}</small>
-                      {block.text}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            )}
+
             <div className="chat-history">
               {(activeSession?.messages ?? []).map((message) => (
                 <article className={`chat-message ${message.role}`} key={message.id}>
                   <span>{message.role === "user" ? "YOU" : "AI"}</span>
-                  <p>{message.content}</p>
-                  {message.role === "assistant" && message.sourceText && (
-                    <details className="message-source">
-                      <summary>근거 보기</summary>
-                      <blockquote>{message.sourceText.slice(0, 900)}</blockquote>
-                    </details>
+                  {message.role === "assistant" && message.contextMode && (
+                    <small className="ask-context-mode">
+                      {askContextLabel(message.contextMode)} 사용
+                    </small>
                   )}
+                  <p>{message.content}</p>
+                  {message.role === "assistant" &&
+                    (message.evidence?.length ?? 0) > 0 && (
+                      <div className="ask-evidence-list">
+                        {message.evidence!.map((evidence, index) => (
+                          <button
+                            type="button"
+                            key={`${message.id}-evidence-${index}`}
+                            onClick={() => onGoToPage(evidence.pageNumber)}
+                            title={evidence.quote}
+                          >
+                            p.{evidence.pageNumber}
+                            {evidence.sectionTitle
+                              ? ` · ${evidence.sectionTitle}`
+                              : ""}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   {message.role === "assistant" && (
                     <button
                       type="button"
@@ -468,27 +234,18 @@ export function ToolRail({
                 </article>
               )}
             </div>
+
             <div className="ask-compose">
               <textarea
                 value={question}
                 onChange={(event) => setQuestion(event.target.value)}
-                placeholder="이 문단에서 저자가 주장하는 핵심은?"
+                placeholder="논문 전체를 바탕으로 질문하세요"
               />
               <button
                 type="button"
-                disabled={
-                  asking ||
-                  !question.trim() ||
-                  (questionScope === "selection" && !selection) ||
-                  (questionScope === "blocks" &&
-                    activeQuestionBlockIds.length === 0)
-                }
+                disabled={asking || !hasDocument || !question.trim()}
                 onClick={() => {
-                  onAsk(
-                    question.trim(),
-                    questionScope,
-                    activeQuestionBlockIds,
-                  );
+                  onAsk(question.trim());
                   setQuestion("");
                 }}
               >
@@ -518,7 +275,7 @@ export function ToolRail({
               <textarea
                 value={noteDraft}
                 onChange={(event) => setNoteDraft(event.target.value)}
-                placeholder="Markdown 메모"
+                placeholder="논문 전체 메모"
               />
               <button
                 type="button"
@@ -539,7 +296,7 @@ export function ToolRail({
                       type="button"
                       onClick={() => note.pageNumber && onGoToPage(note.pageNumber)}
                     >
-                      {note.scope} {note.pageNumber ? `· p.${note.pageNumber}` : ""}
+                      논문 메모 {note.pageNumber ? `· p.${note.pageNumber}` : ""}
                     </button>
                     <button
                       type="button"
@@ -577,7 +334,8 @@ export function ToolRail({
                       className="highlight-swatch"
                       style={{ background: highlight.color }}
                     />
-                    p. {highlight.pageNumber} · {highlight.source}
+                    p. {highlight.pageNumber} ·{" "}
+                    {highlight.source === "original" ? "원문" : "한국어"}
                   </button>
                   <button
                     type="button"

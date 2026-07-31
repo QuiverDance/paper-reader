@@ -1,16 +1,85 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AskEvidence,
   DictionaryEntry,
   LlmSettings,
+  LlmTokenUsage,
   ModelConnectionProfile,
   TranslationRecord,
 } from "../types";
 import { runningInTauri } from "./platform";
+import { estimatedTokenUsage } from "./token-usage";
 
 export type LlmMessage = {
   role: "system" | "user" | "assistant";
   content: string;
 };
+
+export type LlmCompletionResult = {
+  content: string;
+  usage: LlmTokenUsage;
+};
+
+type RawLlmCompletionResult = {
+  content: string;
+  usage?: Partial<LlmTokenUsage> & {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+  };
+};
+
+function completionInput(messages: LlmMessage[]): string {
+  return messages
+    .map((message) => `${message.role}\n${message.content}`)
+    .join("\n");
+}
+
+function exactTokenUsage(
+  usage: RawLlmCompletionResult["usage"],
+): LlmTokenUsage | undefined {
+  const inputTokens =
+    usage?.inputTokens ?? usage?.input_tokens ?? usage?.prompt_tokens;
+  const outputTokens =
+    usage?.outputTokens ??
+    usage?.output_tokens ??
+    usage?.completion_tokens;
+  const totalTokens =
+    usage?.totalTokens ??
+    usage?.total_tokens ??
+    (typeof inputTokens === "number" && typeof outputTokens === "number"
+      ? inputTokens + outputTokens
+      : undefined);
+  if (
+    typeof inputTokens !== "number" ||
+    typeof outputTokens !== "number" ||
+    typeof totalTokens !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    estimated: usage?.estimated === true,
+  };
+}
+
+function normalizeCompletion(
+  result: RawLlmCompletionResult,
+  messages: LlmMessage[],
+): LlmCompletionResult {
+  const content = result.content.trim();
+  if (!content) throw new Error("LLM 응답 내용이 비어 있습니다.");
+  return {
+    content,
+    usage:
+      exactTokenUsage(result.usage) ??
+      estimatedTokenUsage(completionInput(messages), content),
+  };
+}
 
 type TranslationPayload = {
   blocks?: Array<{ id?: unknown; translation?: unknown }>;
@@ -30,10 +99,105 @@ export type CodexAuthStatus = {
   message: string;
 };
 
+export type CodexModelOption = {
+  id: string;
+  displayName: string;
+  isDefault: boolean;
+  defaultReasoningEffort: ModelConnectionProfile["effort"];
+  supportedReasoningEfforts: ModelConnectionProfile["effort"][];
+};
+
+const REASONING_EFFORTS = new Set<ModelConnectionProfile["effort"]>([
+  "default",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
+
+function reasoningEffort(
+  value: unknown,
+  fallback: ModelConnectionProfile["effort"] = "default",
+): ModelConnectionProfile["effort"] {
+  return typeof value === "string" &&
+    REASONING_EFFORTS.has(value as ModelConnectionProfile["effort"])
+    ? (value as ModelConnectionProfile["effort"])
+    : fallback;
+}
+
+export function normalizeCodexModelCatalog(
+  payload: unknown,
+): CodexModelOption[] {
+  const data =
+    payload &&
+    typeof payload === "object" &&
+    Array.isArray((payload as { data?: unknown }).data)
+      ? (payload as { data: unknown[] }).data
+      : [];
+  return data.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const model = entry as Record<string, unknown>;
+    const id =
+      typeof model.model === "string" && model.model.trim()
+        ? model.model.trim()
+        : typeof model.id === "string"
+          ? model.id.trim()
+          : "";
+    if (!id || model.hidden === true) return [];
+    const effortEntries = Array.isArray(model.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts
+      : [];
+    const supportedReasoningEfforts = effortEntries.flatMap((item) => {
+      const value =
+        item && typeof item === "object"
+          ? (item as { reasoningEffort?: unknown }).reasoningEffort
+          : item;
+      const normalized = reasoningEffort(value, "default");
+      return normalized === "default" && value !== "default"
+        ? []
+        : [normalized];
+    });
+    return [
+      {
+        id,
+        displayName:
+          typeof model.displayName === "string" && model.displayName.trim()
+            ? model.displayName.trim()
+            : id,
+        isDefault: model.isDefault === true,
+        defaultReasoningEffort: reasoningEffort(
+          model.defaultReasoningEffort,
+        ),
+        supportedReasoningEfforts,
+      },
+    ];
+  });
+}
+
 type CodexCompletionRequest = {
   messages: LlmMessage[];
   model?: string;
   effort?: LlmSettings["effort"];
+};
+
+type NativePdfUploadRequest = {
+  endpoint: string;
+  apiKey: string;
+  bytes: number[];
+  fileName: string;
+};
+
+type NativePdfQuestionRequest = {
+  endpoint: string;
+  apiKey: string;
+  model: string;
+  effort: LlmSettings["effort"];
+  fileId: string;
+  messages: LlmMessage[];
 };
 
 export const DEFAULT_LLM_SETTINGS: LlmSettings = {
@@ -235,6 +399,27 @@ export function chatCompletionsUrl(endpoint: string): string {
   return `${normalized}/chat/completions`;
 }
 
+export function apiBaseUrl(endpoint: string): string {
+  return endpoint
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/(?:chat\/completions|responses)$/i, "");
+}
+
+export function supportsNativePdf(settings: LlmSettings): boolean {
+  const profile = activeModelProfile(settings);
+  return (
+    profile.connectionMode === "api" &&
+    profile.capabilities.includes("pdf-input")
+  );
+}
+
+export function supportsRemoteFileDelete(settings: LlmSettings): boolean {
+  return activeModelProfile(settings).capabilities.includes(
+    "remote-file-delete",
+  );
+}
+
 async function readJsonResponse<T>(response: Response): Promise<T> {
   const payload = (await response.json().catch(() => null)) as
     | (T & { error?: string })
@@ -273,6 +458,15 @@ export async function startCodexLogin(): Promise<CodexAuthStatus> {
   return readJsonResponse<CodexAuthStatus>(response);
 }
 
+export async function listCodexModels(): Promise<CodexModelOption[]> {
+  const payload = runningInTauri()
+    ? await invoke<unknown>("codex_models")
+    : await readJsonResponse<unknown>(
+        await fetch("/__paperloom/codex/models"),
+      );
+  return normalizeCodexModelCatalog(payload);
+}
+
 async function completeWithCodex(
   request: CodexCompletionRequest,
   signal?: AbortSignal,
@@ -297,8 +491,16 @@ export async function completeChat(
   messages: LlmMessage[],
   signal?: AbortSignal,
 ): Promise<string> {
+  return (await completeChatWithUsage(settings, messages, signal)).content;
+}
+
+export async function completeChatWithUsage(
+  settings: LlmSettings,
+  messages: LlmMessage[],
+  signal?: AbortSignal,
+): Promise<LlmCompletionResult> {
   if (settings.connectionMode === "codex") {
-    return completeWithCodex(
+    const content = await completeWithCodex(
       {
         messages,
         model: settings.codexModel.trim() || undefined,
@@ -306,6 +508,7 @@ export async function completeChat(
       },
       signal,
     );
+    return normalizeCompletion({ content }, messages);
   }
 
   if (!settings.endpoint.trim() || !settings.model.trim()) {
@@ -313,7 +516,7 @@ export async function completeChat(
   }
 
   if (runningInTauri()) {
-    return invoke<string>("llm_chat", {
+    const result = await invoke<RawLlmCompletionResult>("llm_chat", {
       request: {
         endpoint: chatCompletionsUrl(settings.endpoint),
         apiKey: settings.apiKey,
@@ -322,6 +525,7 @@ export async function completeChat(
         messages,
       },
     });
+    return normalizeCompletion(result, messages);
   }
 
   const response = await fetch("/__paperloom/llm/complete", {
@@ -338,9 +542,88 @@ export async function completeChat(
     }),
     signal,
   });
+  const payload = await readJsonResponse<RawLlmCompletionResult>(response);
+  if (!payload.content.trim()) throw new Error("LLM 응답 내용이 비어 있습니다.");
+  return normalizeCompletion(payload, messages);
+}
+
+export async function uploadQuestionPdf(
+  settings: LlmSettings,
+  bytes: Uint8Array,
+  fileName: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (!supportsNativePdf(settings)) {
+    throw new Error("현재 모델 프로필은 PDF 파일 입력을 지원하지 않습니다.");
+  }
+  const request: NativePdfUploadRequest = {
+    endpoint: apiBaseUrl(settings.endpoint),
+    apiKey: settings.apiKey,
+    bytes: Array.from(bytes),
+    fileName,
+  };
+  if (runningInTauri()) {
+    return invoke<string>("llm_upload_pdf", { request });
+  }
+  const response = await fetch("/__paperloom/llm/upload-pdf", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+    signal,
+  });
+  const payload = await readJsonResponse<{ fileId: string }>(response);
+  if (!payload.fileId.trim()) throw new Error("업로드된 PDF 식별자가 없습니다.");
+  return payload.fileId;
+}
+
+export async function completeQuestionWithPdf(
+  settings: LlmSettings,
+  fileId: string,
+  messages: LlmMessage[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const request: NativePdfQuestionRequest = {
+    endpoint: apiBaseUrl(settings.endpoint),
+    apiKey: settings.apiKey,
+    model: settings.model,
+    effort: settings.effort,
+    fileId,
+    messages,
+  };
+  if (runningInTauri()) {
+    return invoke<string>("llm_question_pdf", { request });
+  }
+  const response = await fetch("/__paperloom/llm/question-pdf", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+    signal,
+  });
   const payload = await readJsonResponse<{ content: string }>(response);
   if (!payload.content.trim()) throw new Error("LLM 응답 내용이 비어 있습니다.");
   return payload.content;
+}
+
+export async function deleteQuestionPdf(
+  settings: LlmSettings,
+  fileId: string,
+): Promise<void> {
+  if (!supportsRemoteFileDelete(settings)) return;
+  const request = {
+    endpoint: apiBaseUrl(settings.endpoint),
+    apiKey: settings.apiKey,
+    fileId,
+  };
+  if (runningInTauri()) {
+    await invoke("llm_delete_file", { request });
+    return;
+  }
+  const response = await fetch("/__paperloom/llm/delete-file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  await readJsonResponse<Record<string, never>>(response);
 }
 
 export function translationMessages(
@@ -409,6 +692,17 @@ export function sectionTranslationMessages(
     title: string;
     subsections: string[];
     blocks: Array<{ id: string; type: string; text: string }>;
+    logicalParagraphs?: Array<{
+      id: string;
+      blockIds: string[];
+      text: string;
+      sourceStyle?: {
+        fontWeight?: "normal" | "bold";
+        fontStyle?: "normal" | "italic";
+        paragraphStart?: boolean;
+        boldLead?: boolean;
+      };
+    }>;
   },
   brief: string,
   instructions = "",
@@ -421,8 +715,11 @@ export function sectionTranslationMessages(
         "Translate body prose, explanatory footnotes, and captions only.",
         "Do not translate section headings.",
         "Preserve equations and citation markers exactly.",
+        "Preserve every bracketed protection token exactly once and in its original position.",
+        "When sourceStyle.boldLead is true, translate that lead as the first short sentence so it can retain bold emphasis.",
         "Render Figure N and Fig. N references as 그림 N, and Table N as 표 N, without changing N.",
-        "Do not summarize, omit, merge, or split input blocks.",
+        "Do not summarize or omit input blocks.",
+        "Each input block is one complete logical paragraph assembled from the physical PDF fragments listed in logicalParagraphs. Return one translation for each input block id only.",
         "Return only valid JSON as {blocks:[{id,translation}]}.",
       ].join(" "),
     },
@@ -460,17 +757,97 @@ export function questionMessages(
   question: string,
   sourceText: string,
   language: string,
+  selectedFocus = "",
 ): LlmMessage[] {
   return [
     {
       role: "system",
-      content: `Answer in ${language}. Base the answer only on the supplied paper excerpt. State clearly when the excerpt is insufficient.`,
+      content: [
+        `Answer in ${language}.`,
+        "Use the supplied paper as the complete background context.",
+        "Do not use proceedings cover text, affiliations, author contact details, or bibliography entries as answer evidence.",
+        "Citations that occur inside body prose may be discussed.",
+        "Return only JSON as {answer:string,evidence:[{pageNumber:number,sectionTitle?:string,quote?:string}]}.",
+        "Evidence must point to a page and section actually supplied. If a location cannot be verified, omit it.",
+      ].join(" "),
     },
     {
       role: "user",
-      content: `Paper excerpt:\n${sourceText}\n\nQuestion:\n${question}`,
+      content: [
+        sourceText ? `Paper context:\n${sourceText}` : "The paper is attached as a PDF.",
+        selectedFocus ? `Selected focus:\n${selectedFocus}` : "",
+        `Question:\n${question}`,
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
     },
   ];
+}
+
+export function digestSectionMessages(
+  title: string,
+  text: string,
+): LlmMessage[] {
+  return [
+    {
+      role: "system",
+      content:
+        "Summarize one academic-paper section for later question answering. Preserve claims, methods, assumptions, equations in words, named systems, results, limitations, and page markers. Do not add outside knowledge. Return plain text.",
+    },
+    {
+      role: "user",
+      content: `Section: ${title}\n\n${text}`,
+    },
+  ];
+}
+
+export function parseQuestionResponse(
+  value: string,
+  pageCount: number,
+  knownSections: string[],
+): { answer: string; evidence: AskEvidence[] } {
+  let payload: Record<string, unknown>;
+  try {
+    payload = parseJsonObject(value);
+  } catch {
+    return { answer: stripCodeFence(value).trim(), evidence: [] };
+  }
+  const answer =
+    typeof payload.answer === "string" && payload.answer.trim()
+      ? payload.answer.trim()
+      : stripCodeFence(value).trim();
+  const sectionSet = new Set(knownSections.map((section) => section.trim()));
+  const evidence = Array.isArray(payload.evidence)
+    ? payload.evidence.flatMap((candidate) => {
+        if (!candidate || typeof candidate !== "object") return [];
+        const item = candidate as Record<string, unknown>;
+        if (
+          typeof item.pageNumber !== "number" ||
+          !Number.isInteger(item.pageNumber) ||
+          item.pageNumber < 1 ||
+          item.pageNumber > pageCount
+        ) {
+          return [];
+        }
+        const sectionTitle =
+          typeof item.sectionTitle === "string" &&
+          sectionSet.has(item.sectionTitle.trim())
+            ? item.sectionTitle.trim()
+            : undefined;
+        const quote =
+          typeof item.quote === "string" && item.quote.trim()
+            ? item.quote.trim().slice(0, 320)
+            : undefined;
+        return [{ pageNumber: item.pageNumber, sectionTitle, quote }];
+      })
+    : [];
+  const unique = new Map(
+    evidence.map((item) => [
+      `${item.pageNumber}:${item.sectionTitle ?? ""}:${item.quote ?? ""}`,
+      item,
+    ]),
+  );
+  return { answer, evidence: [...unique.values()].slice(0, 8) };
 }
 
 export function makeTranslationRecord(

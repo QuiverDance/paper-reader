@@ -6,5 +6,6 @@ src-tauri/target
 src-tauri/gen
 tmp/
 output/
+archive/
 *.log
 .DS_Store

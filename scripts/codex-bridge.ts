@@ -18,7 +18,16 @@ type CodexRunResult = {
 
 const ROUTE_PREFIX = "/__paperloom/codex";
 const API_COMPLETION_ROUTE = "/__paperloom/llm/complete";
-const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const API_UPLOAD_PDF_ROUTE = "/__paperloom/llm/upload-pdf";
+const API_QUESTION_PDF_ROUTE = "/__paperloom/llm/question-pdf";
+const API_DELETE_FILE_ROUTE = "/__paperloom/llm/delete-file";
+const API_ROUTES = new Set([
+  API_COMPLETION_ROUTE,
+  API_UPLOAD_PDF_ROUTE,
+  API_QUESTION_PDF_ROUTE,
+  API_DELETE_FILE_ROUTE,
+]);
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
 
 function sendJson(
@@ -135,6 +144,119 @@ function runCodex(
   });
 }
 
+function listCodexModels(
+  codexEntry: string,
+  cwd: string,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolveModels, rejectModels) => {
+    const child = spawn(
+      process.execPath,
+      [codexEntry, "app-server", "--listen", "stdio://"],
+      {
+        cwd,
+        env: process.env,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    let buffer = "";
+    let stderr = "";
+    let settled = false;
+
+    const finish = (
+      callback: () => void,
+    ) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      stopProcessTree(child);
+      callback();
+    };
+    const send = (message: Record<string, unknown>) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    };
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.stdout.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let message: {
+          id?: number;
+          result?: Record<string, unknown>;
+          error?: { message?: string };
+        };
+        try {
+          message = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (message.id === 1) {
+          if (message.error) {
+            finish(() =>
+              rejectModels(
+                new Error(message.error?.message || "Codex 초기화에 실패했습니다."),
+              ),
+            );
+            return;
+          }
+          send({ method: "initialized", params: {} });
+          send({
+            method: "model/list",
+            id: 2,
+            params: { limit: 20, includeHidden: false },
+          });
+        } else if (message.id === 2) {
+          if (message.error || !message.result) {
+            finish(() =>
+              rejectModels(
+                new Error(
+                  message.error?.message || "Codex 모델 목록을 읽지 못했습니다.",
+                ),
+              ),
+            );
+            return;
+          }
+          finish(() => resolveModels(message.result!));
+          return;
+        }
+      }
+    });
+    child.on("error", (error) => finish(() => rejectModels(error)));
+    child.on("close", (code) => {
+      if (!settled) {
+        finish(() =>
+          rejectModels(
+            new Error(
+              stderr.trim() ||
+                `Codex 모델 서버가 예기치 않게 종료되었습니다 (${code ?? "?"}).`,
+            ),
+          ),
+        );
+      }
+    });
+    const timeout = setTimeout(() => {
+      finish(() =>
+        rejectModels(new Error("Codex 모델 목록 요청 시간이 초과되었습니다.")),
+      );
+    }, 20_000);
+    send({
+      method: "initialize",
+      id: 1,
+      params: {
+        clientInfo: {
+          name: "paperloom",
+          title: "Paperloom",
+          version: "0.3.0",
+        },
+      },
+    });
+  });
+}
+
 function messagePrompt(messages: CodexMessage[]): string {
   return [
     "You are the language-model backend for Paperloom, a local PDF reader.",
@@ -150,7 +272,7 @@ function messagePrompt(messages: CodexMessage[]): string {
 function parseMessages(payload: unknown): {
   messages: CodexMessage[];
   model?: string;
-  effort?: "low" | "high" | "max";
+  effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 } {
   if (!payload || typeof payload !== "object") {
     throw new Error("Codex 요청 형식이 올바르지 않습니다.");
@@ -201,9 +323,14 @@ function parseMessages(payload: unknown): {
     throw new Error("Codex 모델명이 너무 깁니다.");
   }
   const effort =
+    candidate.effort === "none" ||
+    candidate.effort === "minimal" ||
     candidate.effort === "low" ||
+    candidate.effort === "medium" ||
     candidate.effort === "high" ||
-    candidate.effort === "max"
+    candidate.effort === "xhigh" ||
+    candidate.effort === "max" ||
+    candidate.effort === "ultra"
       ? candidate.effort
       : undefined;
   return { messages, model, effort };
@@ -213,7 +340,7 @@ function parseApiRequest(payload: unknown): {
   endpoint: string;
   apiKey: string;
   model: string;
-  effort?: "low" | "high" | "max";
+  effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   messages: CodexMessage[];
 } {
   const { messages } = parseMessages(payload);
@@ -257,16 +384,31 @@ function parseApiRequest(payload: unknown): {
     apiKey: candidate.apiKey ?? "",
     model: candidate.model.trim(),
     effort:
+      candidate.effort === "none" ||
+      candidate.effort === "minimal" ||
       candidate.effort === "low" ||
+      candidate.effort === "medium" ||
       candidate.effort === "high" ||
-      candidate.effort === "max"
+      candidate.effort === "xhigh" ||
+      candidate.effort === "max" ||
+      candidate.effort === "ultra"
         ? candidate.effort
         : undefined,
     messages,
   };
 }
 
-async function completeWithApi(payload: unknown): Promise<string> {
+type ApiCompletionResult = {
+  content: string;
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    estimated: false;
+  };
+};
+
+async function completeWithApi(payload: unknown): Promise<ApiCompletionResult> {
   const { endpoint, apiKey, model, effort, messages } = parseApiRequest(payload);
   const response = await fetch(endpoint, {
     method: "POST",
@@ -284,6 +426,13 @@ async function completeWithApi(payload: unknown): Promise<string> {
   });
   const responsePayload = (await response.json().catch(() => null)) as {
     choices?: Array<{ message?: { content?: string | null } }>;
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+      input_tokens?: number;
+      output_tokens?: number;
+    };
     error?: { message?: string };
   } | null;
   if (!response.ok) {
@@ -293,7 +442,206 @@ async function completeWithApi(payload: unknown): Promise<string> {
   }
   const content = responsePayload?.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error("LLM 응답 내용이 비어 있습니다.");
-  return content;
+  const inputTokens =
+    responsePayload?.usage?.input_tokens ??
+    responsePayload?.usage?.prompt_tokens;
+  const outputTokens =
+    responsePayload?.usage?.output_tokens ??
+    responsePayload?.usage?.completion_tokens;
+  const totalTokens =
+    responsePayload?.usage?.total_tokens ??
+    (typeof inputTokens === "number" && typeof outputTokens === "number"
+      ? inputTokens + outputTokens
+      : undefined);
+  return {
+    content,
+    ...(typeof inputTokens === "number" &&
+    typeof outputTokens === "number" &&
+    typeof totalTokens === "number"
+      ? {
+          usage: {
+            inputTokens,
+            outputTokens,
+            totalTokens,
+            estimated: false as const,
+          },
+        }
+      : {}),
+  };
+}
+
+function parseApiBase(payload: unknown): {
+  endpoint: URL;
+  apiKey: string;
+  candidate: Record<string, unknown>;
+} {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("API 요청 형식이 올바르지 않습니다.");
+  }
+  const candidate = payload as Record<string, unknown>;
+  if (typeof candidate.endpoint !== "string") {
+    throw new Error("API endpoint가 필요합니다.");
+  }
+  const endpoint = new URL(candidate.endpoint);
+  const isSecure = endpoint.protocol === "https:";
+  const isLoopback =
+    endpoint.protocol === "http:" &&
+    (endpoint.hostname === "localhost" ||
+      endpoint.hostname === "127.0.0.1" ||
+      endpoint.hostname === "[::1]");
+  if (!isSecure && !isLoopback) {
+    throw new Error("API endpoint는 HTTPS 또는 로컬 HTTP 주소여야 합니다.");
+  }
+  const apiKey =
+    typeof candidate.apiKey === "string" ? candidate.apiKey : "";
+  return { endpoint, apiKey, candidate };
+}
+
+function apiHeaders(apiKey: string, json = false): Record<string, string> {
+  return {
+    ...(json ? { "Content-Type": "application/json" } : {}),
+    ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey}` } : {}),
+  };
+}
+
+async function uploadPdfWithApi(payload: unknown): Promise<string> {
+  const { endpoint, apiKey, candidate } = parseApiBase(payload);
+  if (
+    !Array.isArray(candidate.bytes) ||
+    candidate.bytes.some(
+      (value) =>
+        typeof value !== "number" ||
+        !Number.isInteger(value) ||
+        value < 0 ||
+        value > 255,
+    )
+  ) {
+    throw new Error("PDF 바이트 형식이 올바르지 않습니다.");
+  }
+  const bytes = Uint8Array.from(candidate.bytes);
+  if (bytes.length < 5 || new TextDecoder().decode(bytes.slice(0, 5)) !== "%PDF-") {
+    throw new Error("업로드할 파일이 PDF 형식이 아닙니다.");
+  }
+  const form = new FormData();
+  form.set("purpose", "user_data");
+  form.set(
+    "file",
+    new Blob([bytes], { type: "application/pdf" }),
+    typeof candidate.fileName === "string" &&
+      candidate.fileName.toLowerCase().endsWith(".pdf")
+      ? candidate.fileName
+      : "paper.pdf",
+  );
+  const response = await fetch(new URL("files", `${endpoint.toString().replace(/\/+$/, "")}/`), {
+    method: "POST",
+    headers: apiHeaders(apiKey),
+    body: form,
+    signal: AbortSignal.timeout(180_000),
+  });
+  const responsePayload = (await response.json().catch(() => null)) as {
+    id?: string;
+    error?: { message?: string };
+  } | null;
+  if (!response.ok) {
+    throw new Error(
+      responsePayload?.error?.message ||
+        `PDF 업로드 실패 (${response.status})`,
+    );
+  }
+  if (!responsePayload?.id?.trim()) {
+    throw new Error("업로드된 PDF 식별자가 없습니다.");
+  }
+  return responsePayload.id;
+}
+
+function responsesText(payload: unknown): string {
+  const candidate = payload as {
+    output_text?: string;
+    output?: Array<{ content?: Array<{ text?: string }> }>;
+  };
+  const text =
+    candidate.output_text ||
+    candidate.output
+      ?.flatMap((item) => item.content ?? [])
+      .map((item) => item.text ?? "")
+      .find((item) => item.trim());
+  if (!text?.trim()) throw new Error("LLM 응답 내용이 비어 있습니다.");
+  return text.trim();
+}
+
+async function questionPdfWithApi(payload: unknown): Promise<string> {
+  const { endpoint, apiKey, candidate } = parseApiBase(payload);
+  const { messages } = parseMessages(payload);
+  if (typeof candidate.model !== "string" || !candidate.model.trim()) {
+    throw new Error("API 모델명이 필요합니다.");
+  }
+  if (typeof candidate.fileId !== "string" || !candidate.fileId.trim()) {
+    throw new Error("업로드된 PDF 식별자가 필요합니다.");
+  }
+  const input = messages.map((message) => ({
+    role: message.role,
+    content: [
+      ...(message.role === "user"
+        ? [{ type: "input_file", file_id: candidate.fileId }]
+        : []),
+      { type: "input_text", text: message.content },
+    ],
+  }));
+  const effort =
+    candidate.effort === "none" ||
+    candidate.effort === "minimal" ||
+    candidate.effort === "low" ||
+    candidate.effort === "medium" ||
+    candidate.effort === "high" ||
+    candidate.effort === "xhigh" ||
+    candidate.effort === "max" ||
+    candidate.effort === "ultra"
+      ? candidate.effort
+      : undefined;
+  const response = await fetch(
+    new URL("responses", `${endpoint.toString().replace(/\/+$/, "")}/`),
+    {
+      method: "POST",
+      headers: apiHeaders(apiKey, true),
+      body: JSON.stringify({
+        model: candidate.model,
+        input,
+        ...(effort ? { reasoning: { effort } } : {}),
+      }),
+      signal: AbortSignal.timeout(180_000),
+    },
+  );
+  const responsePayload = (await response.json().catch(() => null)) as {
+    error?: { message?: string };
+  } | null;
+  if (!response.ok) {
+    throw new Error(
+      responsePayload?.error?.message ||
+        `PDF 질문 요청 실패 (${response.status})`,
+    );
+  }
+  return responsesText(responsePayload);
+}
+
+async function deleteFileWithApi(payload: unknown): Promise<void> {
+  const { endpoint, apiKey, candidate } = parseApiBase(payload);
+  if (typeof candidate.fileId !== "string" || !candidate.fileId.trim()) {
+    throw new Error("업로드된 PDF 식별자가 필요합니다.");
+  }
+  const response = await fetch(
+    new URL(
+      `files/${encodeURIComponent(candidate.fileId)}`,
+      `${endpoint.toString().replace(/\/+$/, "")}/`,
+    ),
+    {
+      method: "DELETE",
+      headers: apiHeaders(apiKey),
+      signal: AbortSignal.timeout(60_000),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`원격 PDF 삭제 요청 실패 (${response.status})`);
+  }
 }
 
 export function codexBridge(projectRoot = process.cwd()): Plugin {
@@ -314,7 +662,7 @@ export function codexBridge(projectRoot = process.cwd()): Plugin {
     next: () => void,
   ) => {
     const path = request.url?.split("?")[0] ?? "";
-    if (!path.startsWith(ROUTE_PREFIX) && path !== API_COMPLETION_ROUTE) {
+    if (!path.startsWith(ROUTE_PREFIX) && !API_ROUTES.has(path)) {
       next();
       return;
     }
@@ -324,8 +672,41 @@ export function codexBridge(projectRoot = process.cwd()): Plugin {
     }
     if (request.method === "POST" && path === API_COMPLETION_ROUTE) {
       try {
-        const content = await completeWithApi(await readJsonBody(request));
+        const result = await completeWithApi(await readJsonBody(request));
+        sendJson(response, 200, result);
+      } catch (cause) {
+        sendJson(response, 500, {
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+      return;
+    }
+    if (request.method === "POST" && path === API_UPLOAD_PDF_ROUTE) {
+      try {
+        const fileId = await uploadPdfWithApi(await readJsonBody(request));
+        sendJson(response, 200, { fileId });
+      } catch (cause) {
+        sendJson(response, 500, {
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+      return;
+    }
+    if (request.method === "POST" && path === API_QUESTION_PDF_ROUTE) {
+      try {
+        const content = await questionPdfWithApi(await readJsonBody(request));
         sendJson(response, 200, { content });
+      } catch (cause) {
+        sendJson(response, 500, {
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+      return;
+    }
+    if (request.method === "POST" && path === API_DELETE_FILE_ROUTE) {
+      try {
+        await deleteFileWithApi(await readJsonBody(request));
+        sendJson(response, 200, {});
       } catch (cause) {
         sendJson(response, 500, {
           error: cause instanceof Error ? cause.message : String(cause),
@@ -355,6 +736,15 @@ export function codexBridge(projectRoot = process.cwd()): Plugin {
             result.code === 0 && /logged in|authenticated/i.test(message),
           message: message || "Codex 로그인 상태를 확인했습니다.",
         });
+        return;
+      }
+
+      if (request.method === "GET" && path === `${ROUTE_PREFIX}/models`) {
+        sendJson(
+          response,
+          200,
+          await listCodexModels(codexEntry, workingDirectory),
+        );
         return;
       }
 

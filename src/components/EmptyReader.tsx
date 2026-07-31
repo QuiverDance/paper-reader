@@ -21,10 +21,10 @@ export function EmptyReader({ onOpen }: { onOpen: () => void }) {
 
       <div className="empty-copy">
         <span className="eyebrow">LOCAL-FIRST PAPER READER</span>
-        <h1>논문의 구조를 그대로,<br />두 화면에서 나란히 읽으세요.</h1>
+        <h1>원문과 한국어 논문을<br />한 화면에서 나란히 읽으세요.</h1>
         <p>
-          먼저 로컬 PDF를 열어 기본 리더와 동기화된 분할 뷰를 시작합니다.
-          원본 파일은 변경하지 않습니다.
+          로컬 PDF를 열면 원문이 먼저 표시됩니다. 한국어 논문은 원할 때
+          만들 수 있고, 두 화면의 페이지와 확대 배율은 각각 조절됩니다.
         </p>
         <button type="button" className="primary-action" onClick={onOpen}>
           <FolderOpen size={18} />
@@ -38,4 +38,3 @@ export function EmptyReader({ onOpen }: { onOpen: () => void }) {
     </main>
   );
 }
-
